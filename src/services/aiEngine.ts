@@ -53,8 +53,7 @@ function saveFinancialDataToCsv(symbol: string, financial: FinancialData) {
     }
 }
 
-// 提示词（Prompt）从 Python 版本迁移并适配 TypeScript
-
+// 技术分析提示词
 const TECHNICAL_ANALYSIS_PROMPT = `
 你是一名资深的技术分析师。请基于以下股票数据进行专业的技术面分析：
 
@@ -91,7 +90,7 @@ const TECHNICAL_ANALYSIS_PROMPT = `
 请给出专业、详细的技术分析报告，包含风险提示。
 重要：请不要使用Markdown格式（如**粗体**、## 标题等），直接输出纯文本，使用简单的序号（1. 2. 3.）或缩进即可。保持段落清晰。
 `;
-
+// 基本面分析提示词
 const FUNDAMENTAL_ANALYSIS_PROMPT = `
 你是一名资深的基本面分析师，拥有CFA资格和10年以上的证券分析经验。请基于以下详细信息进行深入的基本面分析：
 
@@ -152,7 +151,7 @@ const FUNDAMENTAL_ANALYSIS_PROMPT = `
 请给出专业、详细的基本面分析报告。
 重要：请不要使用Markdown格式（如**粗体**、## 标题等），直接输出纯文本，使用简单的序号（1. 2. 3.）或缩进即可。保持段落清晰。
 `;
-
+// 资金流向分析提示词
 const FUND_FLOW_ANALYSIS_PROMPT = `
 你是一名资深的资金面分析师，擅长从资金流向数据中洞察主力行为和市场趋势。
 
@@ -260,7 +259,7 @@ const COMPREHENSIVE_DISCUSSION_PROMPT = `
 请模拟一场专业的投资讨论会议，体现不同观点的碰撞和融合。
 重要：请不要使用Markdown格式（如**粗体**、## 标题等），直接输出纯文本，使用简单的序号（1. 2. 3.）或缩进即可。保持段落清晰。
 `;
-
+// 最终决策提示词
 const FINAL_DECISION_PROMPT = `
 基于前期的综合分析讨论，现在需要做出最终的投资决策。
 
@@ -323,7 +322,7 @@ const FINAL_DECISION_PROMPT = `
 `;
 
 // 调用 OpenAI 的辅助函数
-async function callOpenAI(messages: any[], model: string = 'deepseek-chat', temperature: number = 0.7, max_tokens: number = 2000) {
+async function callOpenAI(messages: any[], model: string = 'deepseek-chat', temperature: number = 0.4, max_tokens: number = 2000) {
     // 检查是否为推理模型（如 o1 或 deepseek-reasoner）
     if (model.toLowerCase().includes('reasoner')) {
         max_tokens = 8000;
@@ -335,13 +334,8 @@ async function callOpenAI(messages: any[], model: string = 'deepseek-chat', temp
             messages,
             temperature,
             max_tokens,
-            response_format: model.includes('reasoner') ? undefined : undefined // deepseek-reasoner 可能对 json_object 处理不同，或者文本报告不需要
         });
         
-        // 如果需要，处理 deepseek reasoner 内容，但标准 SDK 通常将其映射到 content
-        // 如果使用 deepseek-reasoner，推理过程可能在不同的字段中，但我们先假设是标准 content。
-        // DeepSeek API 通常将推理放在 'reasoning_content' 中，但标准 OpenAI SDK 可能没有键入它。
-        // 我们暂时只返回 content。
         return response.choices[0].message.content || "无响应";
     } catch (error) {
         console.error("AI 调用失败:", error);
@@ -547,7 +541,7 @@ export async function analyzeStock(input: AIInput): Promise<AIAnalysisResult> {
     console.log("首席分析师正在讨论...");
     const discussionRaw = await callOpenAI(
         [{ role: "system", content: "你是一名资深的首席投资分析师。" }, { role: "user", content: discussPrompt }],
-        'deepseek-chat', 0.7, 6000
+        'deepseek-reasoner', 0.7
     );
     const discussion = cleanMarkdown(discussionRaw);
 
@@ -561,7 +555,7 @@ export async function analyzeStock(input: AIInput): Promise<AIAnalysisResult> {
     console.log("正在做出最终决策...");
     const decisionText = await callOpenAI(
         [{ role: "system", content: "你是一名专业的投资决策专家。" }, { role: "user", content: decisionPrompt }],
-        'deepseek-chat', 0.3, 4000
+        'deepseek-reasoner', 0.3
     );
 
     // 5. 解析结果并映射到前端结构

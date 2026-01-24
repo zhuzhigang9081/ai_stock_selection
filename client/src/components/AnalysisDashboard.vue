@@ -89,7 +89,7 @@
                     </div>
 
                     <div class="mb-8">
-                        <h2 :class="['text-5xl font-black tracking-tight mb-2', adviceStyle.textColor]">
+                        <h2 :class="['font-black tracking-tight mb-2', adviceStyle.textColor,data.tradingStrategy.coreDecision.action.length >10 ?'text-2xl': 'text-5xl' ] ">
                             {{ data.tradingStrategy.coreDecision.action }}
                         </h2>
                         <p class="text-slate-400 font-medium flex items-center gap-2">
@@ -97,7 +97,7 @@
                             建议操作: {{ data.tradingStrategy.coreDecision.urgency }}
                         </p>
                     </div>
-
+                    <!-- TOOD  -->
                     <div class="flex-1 bg-slate-950/30 rounded-xl p-5 border border-slate-800/50 backdrop-blur-sm">
                         <p class="text-base text-slate-300 leading-relaxed whitespace-pre-wrap font-light">
                             {{ data.tradingStrategy.coreDecision.reasoning }}
@@ -124,7 +124,7 @@
                             <GitFork class="w-4 h-4" />
                         </div>
                     </div>
-                    <div :class="['font-mono font-bold text-white mb-2', data.tradingStrategy.entryPlan.optimalEntry.length > 10 ? 'text-base' : 'text-2xl']">{{ data.tradingStrategy.entryPlan.optimalEntry }}</div>
+                    <div :class="['font-mono font-bold text-white mb-2', data.tradingStrategy.entryPlan.optimalEntry.length > 15 ? 'text-base' : 'text-2xl']">{{ data.tradingStrategy.entryPlan.optimalEntry }}</div>
                     <div v-if="data.tradingStrategy.entryPlan.alternativeEntry && data.tradingStrategy.entryPlan.alternativeEntry !== 'N/A'" class="text-sm text-slate-500 border-t border-slate-700/50 pt-2 mt-2">
                         备选方案: <span class="text-slate-400">{{ data.tradingStrategy.entryPlan.alternativeEntry }}</span>
                     </div>
@@ -138,7 +138,7 @@
                             <ShieldAlert class="w-4 h-4" />
                         </div>
                     </div>
-                    <div :class="['font-mono font-bold text-rose-400 mb-2', data.tradingStrategy.riskManagement.stopLoss.price.length > 10 ? 'text-base' : 'text-2xl']">{{ data.tradingStrategy.riskManagement.stopLoss.price }}</div>
+                    <div :class="['font-mono font-bold text-rose-400 mb-2', data.tradingStrategy.riskManagement.stopLoss.price.length > 15 ? 'text-base' : 'text-2xl']">{{ data.tradingStrategy.riskManagement.stopLoss.price }}</div>
                     <div class="text-sm text-slate-500 border-t border-slate-700/50 pt-2 mt-2 flex items-center gap-2">
                          <span class="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
                          风控底线，触达即撤

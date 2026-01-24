@@ -3,6 +3,7 @@ node_modules/
 dist/
 build/
 data/
+data/history.json
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

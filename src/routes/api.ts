@@ -16,6 +16,7 @@ const router = Router();
  *       200:
  *         description: 成功返回历史列表
  */
+//获取诊断历史
 router.get('/history', (req: Request, res: Response) => {
   const history = getHistory();
   res.json(history);
@@ -55,7 +56,7 @@ router.get('/history', (req: Request, res: Response) => {
  *       500:
  *         description: 服务器内部错误
  */
-// 新增：股票搜索接口
+//股票搜索接口
 router.get('/stock/search', async (req: Request, res: Response) => {
   const query = req.query.q as string;
   if (!query) {
@@ -179,6 +180,7 @@ router.get('/stock/search', async (req: Request, res: Response) => {
  *       500:
  *         description: 服务器内部错误
  */
+//ai选股诊断接口
 router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
   const code = req.params.code as string;
   
