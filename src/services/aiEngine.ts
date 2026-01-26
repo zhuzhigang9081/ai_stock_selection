@@ -238,6 +238,13 @@ const COMPREHENSIVE_DISCUSSION_PROMPT = `
 - 股票名称：\${name}
 - 当前价格：\${currentPrice}
 
+【用户个人观点】
+用户（投资者）提供了以下主观判断：" \${userOpinion} "
+**权重说明**：请将此观点的权重设为 **10%**。这意味着：
+1. 当技术/基本/资金面分析出现分歧或方向不明确时，用户的观点应成为决定性因素。
+2. 当客观数据与用户观点完全相反且证据确凿时，应坚持客观数据，但需在风险提示中回应用户的担忧。
+3. 如果用户观点为空，请忽略此项。
+
 技术面分析报告：
 \${technicalReport}
 
@@ -255,6 +262,7 @@ const COMPREHENSIVE_DISCUSSION_PROMPT = `
 4. 潜在风险和机会识别
 5. 不同投资周期的考量（短期、中期、长期）
 6. 市场情绪和预期管理
+7. **用户观点的考量**：明确指出是否采纳了用户的观点，以及原因。
 
 请模拟一场专业的投资讨论会议，体现不同观点的碰撞和融合。
 重要：请不要使用Markdown格式（如**粗体**、## 标题等），直接输出纯文本，使用简单的序号（1. 2. 3.）或缩进即可。保持段落清晰。
@@ -267,6 +275,10 @@ const FINAL_DECISION_PROMPT = `
 - 股票代码：\${symbol}
 - 股票名称：\${name}
 - 当前价格：\${currentPrice}
+
+【用户个人观点】
+用户（投资者）提供了以下主观判断：" \${userOpinion} "
+(权重说明：10%权重，作为倾向性参考)
 
 综合分析讨论结果：
 \${comprehensiveDiscussion}
@@ -423,8 +435,26 @@ export async function analyzeStock(input: AIInput): Promise<AIAnalysisResult> {
     const currentPrice = snapshot.price;
 
     // 保存财务数据到本地文件 (如果存在)
-    if (financial) {
-        saveFinancialDataToCsv(snapshot.symbol, financial);
+    //暂时禁用：如需启用，请取消代码注释
+    // if (financial) {
+    //     saveFinancialDataToCsv(snapshot.symbol, financial);
+    // }
+
+    // 读取用户观点
+    let userOpinion = "";
+    try {
+        const opinionPath = path.join(process.cwd(), 'user_opinion.txt');
+        if (fs.existsSync(opinionPath)) {
+            userOpinion = fs.readFileSync(opinionPath, 'utf-8').trim();
+            // 过滤掉注释行
+            userOpinion = userOpinion.split('\n').filter(line => !line.startsWith('#')).join(' ').trim();
+        }
+    } catch (e) {
+        console.warn("读取用户观点文件失败:", e);
+    }
+
+    if (userOpinion) {
+        console.log(`[AI Engine] 采纳用户观点: "${userOpinion}"`);
     }
 
     // 1. 准备提示词数据
@@ -535,13 +565,14 @@ export async function analyzeStock(input: AIInput): Promise<AIAnalysisResult> {
         ...stockInfoMap,
         technicalReport: techReport,
         fundamentalReport: fundReport,
-        fundFlowReport: flowReport
+        fundFlowReport: flowReport,
+        userOpinion: userOpinion || "（用户未提供个人观点）"
     });
 
     console.log("首席分析师正在讨论...");
     const discussionRaw = await callOpenAI(
         [{ role: "system", content: "你是一名资深的首席投资分析师。" }, { role: "user", content: discussPrompt }],
-        'deepseek-reasoner', 0.7
+        'deepseek-chat', 0.7, 6000
     );
     const discussion = cleanMarkdown(discussionRaw);
 
@@ -549,7 +580,8 @@ export async function analyzeStock(input: AIInput): Promise<AIAnalysisResult> {
     const decisionPrompt = replacePlaceholders(FINAL_DECISION_PROMPT, {
         ...stockInfoMap,
         ...indicatorsMap,
-        comprehensiveDiscussion: discussion
+        comprehensiveDiscussion: discussion,
+        userOpinion: userOpinion || "（用户未提供个人观点）"
     });
 
     console.log("正在做出最终决策...");
