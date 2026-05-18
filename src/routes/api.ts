@@ -1,8 +1,8 @@
 import { Router, Request, Response } from 'express';
 import { fetchStockSnapshot, fetchStockHistory, searchStocks, fetchStockSector, fetchIndustryRank, fetchFinancialData, fetchFundFlowData, StockSnapshot } from '../services/dataService';
-import { analyzeStock } from '../services/aiEngine';
+import { analyzeStock, answerReportQuestion } from '../services/aiEngine';
 
-import { getHistory, addHistory } from '../services/historyService';
+import { getHistory, addHistory, getLatestHistoryBySymbol, buildContinuitySummary } from '../services/historyService';
 
 const router = Router();
 
@@ -18,8 +18,36 @@ const router = Router();
  */
 //获取诊断历史
 router.get('/history', (req: Request, res: Response) => {
-  const history = getHistory();
+  const history = getHistory().filter((item) => item.mode === 'postmarket' || !item.mode);
   res.json(history);
+});
+
+router.post('/report/qa', async (req: Request, res: Response) => {
+  try {
+    const { question, reportData, symbol } = req.body || {};
+    if (!question || !reportData) {
+      return res.status(400).json({ error: 'question 和 reportData 为必填项' });
+    }
+
+    const continuityPrevious = reportData?.continuity?.previousReport || null;
+    const historyRecord = !continuityPrevious && symbol
+      ? getLatestHistoryBySymbol(symbol, 'postmarket')
+      : null;
+    const previousReport = continuityPrevious || buildContinuitySummary(historyRecord);
+    const answer = await answerReportQuestion({
+      question,
+      reportData,
+      previousReport,
+    });
+
+    res.json({
+      answer,
+      previousReport,
+    });
+  } catch (error) {
+    console.error('报告问答失败:', error);
+    res.status(500).json({ error: '报告问答失败', details: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 /**
@@ -183,21 +211,33 @@ router.get('/stock/search', async (req: Request, res: Response) => {
 //ai选股诊断接口
 router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
   const code = req.params.code as string;
+  const analystsParam = req.query.analysts;
+  const mode = 'postmarket';
+  
+  let analysts: string[] = ['technical', 'fundamental', 'capital']; // Default
+
+  if (typeof analystsParam === 'string') {
+      analysts = analystsParam.split(',');
+  } else if (Array.isArray(analystsParam)) {
+      analysts = analystsParam as string[];
+  }
   
   try {
     console.log(`正在分析股票: ${code}`);
+    console.log(`分析模式: ${mode}`);
+    console.log(`选定的分析师: ${analysts.join(', ')}`);
+    console.log('正在获取盘后复盘数据...');
 
-    // 使用腾讯和东方财富接口获取数据
-    console.log('正在从腾讯和东方财富获取股票数据...');
-    
-    // 并行获取：快照、K线、行业名称、行业排行、基本面数据、资金流向
-    const [snapshot, history, sectorName, industryRankList, financial, fundFlow] = await Promise.all([
-      fetchStockSnapshot(code),
+    const [snapshot, history] = await Promise.all([
+      fetchStockSnapshot(code, mode),
       fetchStockHistory(code),
+    ]);
+
+    const [sectorName, industryRankList, financial, fundFlow] = await Promise.all([
       fetchStockSector(code),
-      fetchIndustryRank(20), // 获取前20名
+      fetchIndustryRank(20),
       fetchFinancialData(code),
-      fetchFundFlowData(code)
+      fetchFundFlowData(code),
     ]);
 
     console.log('快照已获取:', snapshot);
@@ -232,17 +272,24 @@ router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
       history,
       industryInfo,
       financial,
-      fundFlow
+      fundFlow,
+      previousReport: buildContinuitySummary(getLatestHistoryBySymbol(code, mode)),
+      mode,
+      analysts
     });
 
     // 组装返回结果
     const responseData = {
+      symbol: code,
       stockName: snapshot.name || code,
       currentPrice: snapshot.price,
       changePercent: snapshot.changePercent, // 透传涨跌幅
       turnoverRate: snapshot.turnoverRate, // 透传换手率
       volumeRatio: snapshot.volumeRatio,   // 透传量比
       marketSentiment: snapshot.marketSentiment, // 透传市场环境
+      analysisMode: aiResult.analysisMode,
+      analysisModeLabel: aiResult.analysisModeLabel,
+      analysisDisclaimer: aiResult.analysisDisclaimer,
 
       // 核心摘要
       executiveSummary: aiResult.executiveSummary,
@@ -265,6 +312,8 @@ router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
       performanceMetrics: aiResult.performanceMetrics,
       // 教育洞察
       educationalInsights: aiResult.educationalInsights,
+      // 数据质量
+      dataQuality: aiResult.dataQuality,
       
       // 兼容旧字段
       levels: aiResult.levels,
@@ -274,6 +323,7 @@ router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
 
     // 保存到历史记录
     addHistory({
+        mode,
         stockName: snapshot.name || code,
         symbol: code,
         score: aiResult.score,

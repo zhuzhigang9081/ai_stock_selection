@@ -1,4 +1,8 @@
 export interface StockAnalysis {
+  analysisMode?: 'postmarket';
+  analysisModeLabel?: string;
+  analysisDisclaimer?: string;
+  symbol?: string;
   stockName: string;
   currentPrice: number;
   changePercent: number;
@@ -100,6 +104,21 @@ export interface StockAnalysis {
     patternRecognition: string;
   };
 
+  dataQuality?: {
+    snapshot?: DataQualityMeta;
+    history?: DataQualityMeta;
+    financial?: DataQualityMeta | null;
+    fundFlow?: {
+      summary: DataQualityMeta | null;
+      missingDays: number;
+    };
+  };
+
+  continuity?: {
+    previousReport?: ReportContinuitySummary | null;
+    continuityNote?: string;
+  };
+
   // 兼容旧字段
   levels: {
     entry: number;
@@ -139,4 +158,31 @@ export interface ScenarioCase {
   riskFactors?: string;
   worstCasePrice?: string;
   damageControl?: string;
+}
+
+export interface DataQualityMeta {
+  source: string;
+  endpoint: string;
+  tier: 'primary' | 'fallback' | 'cache';
+  fetchedAt: string;
+  asOf?: string;
+  cacheHit: boolean;
+  stale: boolean;
+  isEstimated: boolean;
+  qualityScore: number;
+  qualityLevel: 'high' | 'medium' | 'low';
+  issues: string[];
+}
+
+export interface ReportContinuitySummary {
+  timestamp: number;
+  stockName: string;
+  symbol: string;
+  score: number;
+  advice: string;
+  oneLineDecision?: string;
+  currentPrice?: number;
+  targetPrice?: number | null;
+  stopLoss?: number | null;
+  reasoning?: string;
 }

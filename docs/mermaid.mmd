@@ -1,0 +1,129 @@
+sequenceDiagram
+    autonumber
+    participant U as 用户 User
+    participant API as 后端接口 Node API
+    participant DS as 数据服务 DataService
+    participant TSB as Python桥 Tushare Bridge
+    participant TSP as Tushare数据源 Tushare API
+    participant TX as Tencent
+    participant EM as EastMoney
+    participant AI as 分析引擎 AI Engine
+    participant OAI as LLM
+    participant HIS as 历史记录 history.json
+
+    %% 第 1 段：用户发起诊断请求
+    U->>API: 请求诊断 GET /api/stock/diagnosis/:code
+    API->>API: 解析股票代码 / 分析师
+    API->>API: 输出日志
+
+    %% 第 2 段：并行获取快照和历史K线
+    par Snapshot
+        API->>DS: 获取快照 fetchStockSnapshot(code)
+        DS->>TSB: 调 Tushare 桥 snapshot
+        TSB->>TSP: 查询名称 / 日线 / 换手率 / 量比
+        TSP-->>TSB: 返回快照数据
+        alt Tushare OK
+            TSB-->>DS: 快照 + 时间 + 数据问题说明
+        else Tushare Fail
+            DS->>TX: 回退到腾讯快照
+            TX-->>DS: 返回盘中快照
+        end
+        DS-->>API: 返回快照 + dataQuality
+    and History
+        API->>DS: 获取历史K线 fetchStockHistory(code)
+        DS->>TSB: 调 Tushare 桥 history
+        TSB->>TSP: 查询日线K线
+        TSP-->>TSB: 返回K线
+        alt Tushare OK
+            TSB-->>DS: 返回K线列表
+        else Tushare Fail
+            DS->>TX: 回退到腾讯 fqkline
+            TX-->>DS: 返回历史K线回退数据
+        end
+        DS->>DS: 计算 MA RSI MACD KDJ BOLL ATR Bias
+        DS-->>API: 返回历史K线 + dataQuality
+    end
+
+    %% 第 3 段：继续获取行业 / 财务 / 资金流
+    par Sector
+        API->>DS: 获取行业归属 fetchStockSector(code)
+        DS->>TSB: 调 Tushare 桥 sector
+        TSB->>TSP: 查询 stock_basic.industry
+        TSP-->>TSB: 返回行业
+        alt Tushare OK
+            TSB-->>DS: 返回行业
+        else Tushare Fail
+            DS->>EM: 回退到东财行业接口
+            EM-->>DS: 返回行业回退数据
+        end
+        DS-->>API: 返回 sectorName
+    and Industry Rank
+        API->>DS: 获取行业排行 fetchIndustryRank(20)
+        DS->>TSB: 调 Tushare 桥 industry_rank
+        TSB->>TSP: 查询申万行业日线 sw_daily
+        TSP-->>TSB: 返回行业排行
+        alt Tushare OK
+            TSB-->>DS: 返回排行列表
+        else Tushare Fail
+            DS->>EM: 回退到东财行业排行接口
+            EM-->>DS: 返回排行回退数据
+        end
+        DS-->>API: 返回 industryRankList
+    and Financial
+        API->>DS: 获取财务数据 fetchFinancialData(code)
+        DS->>TSB: 调 Tushare 桥 financial
+        TSB->>TSP: 查询 daily_basic + fina_indicator
+        TSP-->>TSB: 返回 PE PB ROE 毛利率 负债率 同比 市值
+        alt Tushare OK
+            TSB-->>DS: 返回财务数据
+        else Tushare Fail
+            DS->>EM: 回退到东财财务接口
+            EM-->>DS: 返回财务回退数据
+        end
+        DS-->>API: 返回 financial + dataQuality
+    and FundFlow
+        API->>DS: 获取资金流 fetchFundFlowData(code)
+        DS->>TSB: 调 Tushare 桥 fundflow
+        TSB->>TSP: 查询 moneyflow
+        TSB->>TSP: 额外查询 daily 补收盘价和涨跌幅
+        TSP-->>TSB: 返回资金流和价格
+        alt Tushare OK
+            TSB-->>DS: 返回近30日资金流
+        else Tushare Fail
+            DS->>EM: 回退到东财资金流接口
+            EM-->>DS: 返回资金流回退数据
+        end
+        DS-->>API: 返回 fundFlow + dataQuality
+    end
+
+    %% 第 4 段：把数据交给 AI 分析
+    API->>API: 组装 industryInfo
+    API->>AI: analyzeStock(snapshot history industryInfo financial fundFlow analysts previousReport)
+
+    AI->>AI: 汇总 dataQuality
+    AI->>AI: 读取 user_opinion.txt
+    AI->>AI: 构造各分析师 Prompt
+
+    par Technical Analyst
+        AI->>OAI: 技术面 Prompt
+        OAI-->>AI: 技术面报告
+    and Fundamental Analyst
+        AI->>OAI: 基本面 Prompt
+        OAI-->>AI: 基本面报告
+    and Capital Analyst
+        AI->>OAI: 资金面 Prompt
+        OAI-->>AI: 资金面报告
+    end
+
+    AI->>OAI: 综合讨论 Prompt
+    OAI-->>AI: 综合讨论结果
+    AI->>OAI: 最终决策 Prompt
+    OAI-->>AI: 决策 JSON
+    AI->>AI: 清洗和标准化输出
+    AI-->>API: 返回 AIAnalysisResult
+
+    %% 第 5 段：保存结果并返回给前端
+    API->>API: 组装 responseData
+    API->>HIS: addHistory(fullData)
+    HIS-->>API: 保存完成
+    API-->>U: 返回最终诊断 JSON

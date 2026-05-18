@@ -1,5 +1,44 @@
 <template>
   <div class="space-y-6 p-6 max-w-[1800px] mx-auto text-slate-200">
+    <div
+        v-if="data.analysisModeLabel || data.analysisDisclaimer"
+        class="rounded-2xl border border-emerald-500/25 bg-emerald-500/10 px-5 py-4 shadow-lg"
+    >
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div class="flex items-center gap-3">
+                <span class="inline-flex rounded-full border border-emerald-400/30 bg-emerald-400/10 px-3 py-1 text-xs font-bold uppercase tracking-[0.25em] text-emerald-200">
+                    {{ data.analysisModeLabel || '分析模式' }}
+                </span>
+                <span class="text-sm text-slate-300">
+                    偏正式结论
+                </span>
+            </div>
+            <span class="text-xs text-slate-400">
+                盘后建议可纳入正式计划
+            </span>
+        </div>
+        <p v-if="data.analysisDisclaimer" class="mt-3 text-sm leading-relaxed text-slate-200">
+            {{ data.analysisDisclaimer }}
+        </p>
+    </div>
+
+    <div
+        v-if="postmarketAsOfSummary"
+        class="rounded-2xl border border-cyan-500/20 bg-cyan-500/10 px-5 py-4 shadow-lg"
+    >
+        <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+                <p class="text-xs uppercase tracking-[0.28em] text-cyan-300/80">数据日期</p>
+                <p class="mt-1 text-lg font-semibold text-cyan-50">
+                    本次盘后复盘主要基于 <span class="font-mono">{{ postmarketAsOfSummary.primaryDate }}</span> 的数据
+                </p>
+            </div>
+            <div class="text-sm text-cyan-100/90">
+                {{ postmarketAsOfSummary.detailText }}
+            </div>
+        </div>
+    </div>
+
     <!-- 1. Header Section: Modern Trading Terminal Style -->
     <div class="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-6 pb-6 border-b border-slate-800">
         <!-- Stock Info -->
@@ -155,11 +194,11 @@
                     </div>
                     <div class="grid grid-cols-2 gap-8">
                         <div>
-                            <span class="text-xs text-emerald-500/70 font-bold uppercase tracking-wider mb-1 block">Target 1</span>
+                            <span class="text-xs text-emerald-500/70 font-bold uppercase tracking-wider mb-1 block">目标一</span>
                             <div class="text-xl font-mono font-bold text-emerald-400">{{ data.tradingStrategy.profitTaking.target1.price }}</div>
                         </div>
                         <div v-if="data.tradingStrategy.profitTaking.target2.price && data.tradingStrategy.profitTaking.target2.price !== '0'" class="pl-8 border-l border-slate-700/50">
-                            <span class="text-xs text-slate-500 font-bold uppercase tracking-wider mb-1 block">Target 2</span>
+                            <span class="text-xs text-slate-500 font-bold uppercase tracking-wider mb-1 block">目标二</span>
                             <div class="text-xl font-mono font-bold text-slate-300">{{ data.tradingStrategy.profitTaking.target2.price }}</div>
                         </div>
                     </div>
@@ -196,6 +235,52 @@
         </div>
     </div>
 
+    <div v-if="qualityCards.length > 0" class="bg-slate-900/60 rounded-2xl border border-slate-800 p-6">
+        <div class="flex items-center justify-between gap-4 mb-5">
+            <div class="flex items-center gap-2">
+                <Info class="w-5 h-5 text-cyan-400" />
+                <h3 class="text-lg font-bold text-slate-100">数据质量状态</h3>
+            </div>
+            <span class="text-xs text-slate-500">公开接口环境下的实时可信度提示</span>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+            <div
+                v-for="card in qualityCards"
+                :key="card.key"
+                class="rounded-xl border p-4 transition-colors"
+                :class="card.panelClass"
+            >
+                <div class="flex items-start justify-between gap-3 mb-3">
+                    <div>
+                        <div class="text-sm font-semibold text-slate-100">{{ card.label }}</div>
+                        <div class="text-xs text-slate-400 mt-1">{{ card.source }}</div>
+                    </div>
+                    <span class="px-2 py-1 rounded-full text-xs font-mono border" :class="card.badgeClass">
+                        {{ card.scoreText }}
+                    </span>
+                </div>
+
+                <div class="space-y-2 text-xs text-slate-400">
+                    <div>日期 {{ formatAsOf(card.asOf) }}</div>
+                    <div>链路 {{ card.tierText }}</div>
+                    <div>{{ card.flagsText }}</div>
+                    <div v-if="card.extraText" class="text-amber-300">{{ card.extraText }}</div>
+                </div>
+
+                <div v-if="card.issues.length > 0" class="mt-3 pt-3 border-t border-slate-700/60 space-y-1">
+                    <div
+                        v-for="issue in card.issues"
+                        :key="issue"
+                        class="text-xs text-slate-300 leading-relaxed break-words whitespace-normal"
+                    >
+                        {{ issue }}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <DetailedReportModal 
         v-if="showDetailModal" 
         :data="data" 
@@ -207,8 +292,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { 
-    BrainCircuit, TrendingUp, BarChart2, Activity, Target, 
-    Calculator, Zap, AlertTriangle, Globe, ShieldAlert, GitFork, FileText, Info
+    BrainCircuit, TrendingUp, Activity, Target, 
+    ShieldAlert, GitFork, FileText, Info
 } from 'lucide-vue-next';
 import DetailedReportModal from './DetailedReportModal.vue';
 import type { StockAnalysis } from '../types';
@@ -218,11 +303,6 @@ const props = defineProps<{
 }>();
 
 const showDetailModal = ref(false);
-
-const isShort = (text?: string) => {
-    if (!text) return true;
-    return text.length < 15;
-};
 
 const scoreColorClass = computed(() => {
     const s = props.data.diagnosis.score;
@@ -253,6 +333,94 @@ const adviceStyle = computed(() => {
         glowColor: 'bg-slate-600',
         textColor: 'text-slate-300',
         badge: 'bg-slate-500/10 text-slate-300 border-slate-500/20'
+    };
+});
+
+const qualityCards = computed(() => {
+    const quality = props.data.dataQuality;
+    if (!quality) return [];
+
+    const cards = [
+        { key: 'snapshot', label: '实时快照', meta: quality.snapshot, extraText: '' },
+        { key: 'history', label: '历史K线', meta: quality.history, extraText: '' },
+        { key: 'financial', label: '财务数据', meta: quality.financial || undefined, extraText: '' },
+        {
+            key: 'fundflow',
+            label: '资金流',
+            meta: quality.fundFlow?.summary || undefined,
+            extraText: quality.fundFlow && quality.fundFlow.missingDays > 0
+                ? `${quality.fundFlow.missingDays} 个交易日存在字段缺失`
+                : ''
+        }
+    ];
+
+    return cards
+        .filter((card) => card.meta)
+        .map((card) => {
+            const meta = card.meta!;
+            const tone = meta.qualityLevel === 'high'
+                ? {
+                    panelClass: 'border-emerald-500/20 bg-emerald-500/5',
+                    badgeClass: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                }
+                : meta.qualityLevel === 'medium'
+                    ? {
+                        panelClass: 'border-amber-500/20 bg-amber-500/5',
+                        badgeClass: 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                    }
+                    : {
+                        panelClass: 'border-rose-500/20 bg-rose-500/5',
+                        badgeClass: 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                    };
+
+            return {
+                ...card,
+                ...tone,
+                source: meta.source,
+                scoreText: `${meta.qualityLevel.toUpperCase()} ${meta.qualityScore}`,
+                asOf: meta.asOf || '未知',
+                tierText: meta.tier === 'primary' ? '主接口' : meta.tier === 'fallback' ? '回退接口' : '缓存',
+                flagsText: [
+                    meta.cacheHit ? '命中缓存' : '实时抓取',
+                    meta.stale ? '已过期' : '未过期',
+                    meta.isEstimated ? '含估算字段' : '无估算'
+                ].join(' / '),
+                issues: meta.issues.slice(0, 3),
+            };
+        });
+});
+
+const formatAsOf = (value?: string) => {
+    if (!value) return '未知';
+    const normalized = value.replace('T', ' ');
+    const match = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match ? match[1] : value;
+};
+
+const postmarketAsOfSummary = computed(() => {
+    if (props.data.analysisMode !== 'postmarket') return null;
+
+    const quality = props.data.dataQuality;
+    if (!quality) return null;
+
+    const historyDate = quality.history?.asOf;
+    const fundFlowDate = quality.fundFlow?.summary?.asOf;
+    const financialDate = quality.financial?.asOf;
+    const snapshotDate = quality.snapshot?.asOf;
+    const primaryDate = historyDate || fundFlowDate || financialDate || snapshotDate;
+
+    if (!primaryDate) return null;
+
+    const details = [
+        historyDate ? `K线 ${historyDate}` : null,
+        fundFlowDate ? `资金流 ${fundFlowDate}` : null,
+        financialDate ? `财务 ${financialDate}` : null,
+        snapshotDate ? `快照 ${snapshotDate}` : null,
+    ].filter(Boolean);
+
+    return {
+        primaryDate,
+        detailText: details.join(' | '),
     };
 });
 </script>

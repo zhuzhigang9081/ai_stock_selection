@@ -1,7 +1,383 @@
 import axios from 'axios';
+import { execFile } from 'child_process';
 import iconv from 'iconv-lite';
 import http from 'http';
 import https from 'https';
+import path from 'path';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
+
+type DataSourceTier = 'primary' | 'fallback' | 'cache';
+type DataQualityLevel = 'high' | 'medium' | 'low';
+
+export interface DataQualityMeta {
+  source: string;
+  endpoint: string;
+  tier: DataSourceTier;
+  fetchedAt: string;
+  asOf?: string;
+  cacheHit: boolean;
+  stale: boolean;
+  isEstimated: boolean;
+  qualityScore: number;
+  qualityLevel: DataQualityLevel;
+  issues: string[];
+}
+
+interface RequestResult<T> {
+  data: T;
+  asOf?: string;
+  issues?: string[];
+  isEstimated?: boolean;
+}
+
+interface PublicRequestOptions<T> {
+  cacheKey: string;
+  endpoint: string;
+  source: string;
+  cacheTtlMs: number;
+  staleTtlMs?: number;
+  requestFn: () => Promise<RequestResult<T>>;
+  fallbackFn?: () => Promise<RequestResult<T>>;
+}
+
+interface CacheEntry<T> {
+  value: T;
+  meta: DataQualityMeta;
+  expiresAt: number;
+  staleUntil: number;
+}
+
+const requestCache = new Map<string, CacheEntry<unknown>>();
+
+const CACHE_TTLS = {
+  snapshot: 20 * 1000,
+  history: 10 * 60 * 1000,
+  sector: 6 * 60 * 60 * 1000,
+  industryRank: 2 * 60 * 1000,
+  financial: 12 * 60 * 60 * 1000,
+  fundFlow: 2 * 60 * 1000,
+} as const;
+
+const PYTHON_BRIDGE_BIN =
+  process.env.TUSHARE_PYTHON || '/Users/zhuzhigang/.agents/skills/股票分析/venv/bin/python';
+const TUSHARE_PYTHON = PYTHON_BRIDGE_BIN;
+const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
+const TUSHARE_BRIDGE = path.join(PROJECT_ROOT, 'scripts', 'tushare_bridge.py');
+
+const EASTMONEY_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+  Referer: 'http://quote.eastmoney.com/',
+  Connection: 'close',
+};
+
+function createEastMoneyAxiosConfig(params?: Record<string, unknown>) {
+  return {
+    params,
+    headers: EASTMONEY_HEADERS,
+    httpAgent: new http.Agent({ keepAlive: false }),
+    httpsAgent: new https.Agent({ keepAlive: false }),
+    timeout: 5000,
+    family: 4 as const,
+  };
+}
+
+function toHttpsFirstEastMoneyUrls(url: string): string[] {
+  if (url.startsWith('https://')) return [url, url.replace(/^https:/, 'http:')];
+  if (url.startsWith('http://')) return [url.replace(/^http:/, 'https:'), url];
+  return [url];
+}
+
+function isRetryableNetworkError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const code = 'code' in error ? String((error as { code?: string }).code || '') : '';
+  return ['ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'EAI_AGAIN'].includes(code);
+}
+
+async function requestEastMoney(url: string, params?: Record<string, unknown>) {
+  const urls = toHttpsFirstEastMoneyUrls(url);
+  let lastError: unknown = null;
+
+  for (const candidate of urls) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await axios.get(candidate, createEastMoneyAxiosConfig(params));
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableNetworkError(error)) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+function toSecid(symbol: string): string {
+  if (symbol.endsWith('.SZ')) return `0.${symbol.replace('.SZ', '')}`;
+  if (symbol.endsWith('.SH')) return `1.${symbol.replace('.SH', '')}`;
+  return '';
+}
+
+function toMarketCode(symbol: string): 'sz' | 'sh' | null {
+  if (symbol.endsWith('.SZ')) return 'sz';
+  if (symbol.endsWith('.SH')) return 'sh';
+  return null;
+}
+
+function toPlainCode(symbol: string): string {
+  return symbol.replace(/\.(SZ|SH)$/, '');
+}
+
+async function runTushareBridge<T>(command: string, payload: Record<string, unknown>): Promise<RequestResult<T>> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const { stdout, stderr } = await execFileAsync(
+        TUSHARE_PYTHON,
+        [TUSHARE_BRIDGE, command, JSON.stringify(payload)],
+        { maxBuffer: 1024 * 1024 * 8 }
+      );
+
+      const raw = stdout.trim();
+      if (!raw) {
+        throw new Error(`Tushare bridge empty stdout${stderr ? `: ${stderr.trim()}` : ''}`);
+      }
+
+      const parsed = JSON.parse(raw);
+      if (!parsed.ok) {
+        throw new Error(parsed.error || 'Tushare bridge failed');
+      }
+
+      return {
+        data: parsed.data as T,
+        asOf: parsed.asOf,
+        issues: Array.isArray(parsed.issues) ? parsed.issues : [],
+        isEstimated: Boolean(parsed.isEstimated),
+      };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError && typeof lastError === 'object') {
+    const execError = lastError as {
+      message?: string;
+      stdout?: string | Buffer;
+      stderr?: string | Buffer;
+    };
+    const stdoutText = execError.stdout ? String(execError.stdout).trim() : '';
+    const stderrText = execError.stderr ? String(execError.stderr).trim() : '';
+    throw new Error(
+      [
+        execError.message || 'Tushare bridge failed',
+        stderrText ? `stderr: ${stderrText}` : '',
+        stdoutText ? `stdout: ${stdoutText}` : '',
+      ]
+        .filter(Boolean)
+        .join(' | ')
+    );
+  }
+
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+function formatBridgeDate(value?: string | null): string | undefined {
+  if (!value) return undefined;
+  const normalized = String(value).trim();
+  if (/^\d{8}$/.test(normalized)) {
+    return `${normalized.slice(0, 4)}-${normalized.slice(4, 6)}-${normalized.slice(6, 8)}`;
+  }
+  return normalized;
+}
+
+function computeQualityLevel(score: number): DataQualityLevel {
+  if (score >= 85) return 'high';
+  if (score >= 65) return 'medium';
+  return 'low';
+}
+
+function dedupeIssues(issues: string[]): string[] {
+  return [...new Set(issues.filter(Boolean))];
+}
+
+function createMeta(params: {
+  source: string;
+  endpoint: string;
+  tier: DataSourceTier;
+  asOf?: string;
+  cacheHit?: boolean;
+  stale?: boolean;
+  isEstimated?: boolean;
+  issues?: string[];
+}): DataQualityMeta {
+  const issues = dedupeIssues(params.issues || []);
+  let qualityScore = 96;
+
+  if (params.tier === 'fallback') qualityScore -= 10;
+  if (params.tier === 'cache') qualityScore -= params.stale ? 18 : 6;
+  if (params.isEstimated) qualityScore -= 20;
+  if (params.stale) qualityScore -= 10;
+  qualityScore -= Math.min(issues.length * 7, 28);
+
+  const normalizedScore = Math.max(25, Math.min(99, qualityScore));
+
+  return {
+    source: params.source,
+    endpoint: params.endpoint,
+    tier: params.tier,
+    fetchedAt: new Date().toISOString(),
+    asOf: params.asOf,
+    cacheHit: params.cacheHit ?? false,
+    stale: params.stale ?? false,
+    isEstimated: params.isEstimated ?? false,
+    qualityScore: normalizedScore,
+    qualityLevel: computeQualityLevel(normalizedScore),
+    issues,
+  };
+}
+
+function getCachedEntry<T>(cacheKey: string, includeStale: boolean): CacheEntry<T> | null {
+  const entry = requestCache.get(cacheKey) as CacheEntry<T> | undefined;
+  if (!entry) return null;
+
+  const now = Date.now();
+  if (entry.expiresAt > now) {
+    return entry;
+  }
+
+  if (includeStale && entry.staleUntil > now) {
+    return entry;
+  }
+
+  requestCache.delete(cacheKey);
+  return null;
+}
+
+function setCachedEntry<T>(
+  cacheKey: string,
+  value: T,
+  meta: DataQualityMeta,
+  cacheTtlMs: number,
+  staleTtlMs: number
+) {
+  const now = Date.now();
+  requestCache.set(cacheKey, {
+    value,
+    meta,
+    expiresAt: now + cacheTtlMs,
+    staleUntil: now + cacheTtlMs + staleTtlMs,
+  });
+}
+
+async function fetchWithPublicApiResilience<T>(options: PublicRequestOptions<T>): Promise<{ data: T; meta: DataQualityMeta }> {
+  const freshCache = getCachedEntry<T>(options.cacheKey, false);
+  if (freshCache) {
+    return {
+      data: freshCache.value,
+      meta: createMeta({
+        source: freshCache.meta.source,
+        endpoint: freshCache.meta.endpoint,
+        tier: 'cache',
+        asOf: freshCache.meta.asOf,
+        cacheHit: true,
+        stale: false,
+        isEstimated: freshCache.meta.isEstimated,
+        issues: [...freshCache.meta.issues, '使用内存缓存结果，减少公开接口波动影响'],
+      }),
+    };
+  }
+
+  try {
+    const result = await options.requestFn();
+    const meta = createMeta({
+      source: options.source,
+      endpoint: options.endpoint,
+      tier: 'primary',
+      asOf: result.asOf,
+      isEstimated: result.isEstimated,
+      issues: result.issues,
+    });
+    setCachedEntry(
+      options.cacheKey,
+      result.data,
+      meta,
+      options.cacheTtlMs,
+      options.staleTtlMs ?? options.cacheTtlMs * 3
+    );
+    return { data: result.data, meta };
+  } catch (primaryError) {
+    const primaryMessage = primaryError instanceof Error ? primaryError.message : String(primaryError);
+
+    if (options.fallbackFn) {
+      try {
+        const fallbackResult = await options.fallbackFn();
+        const meta = createMeta({
+          source: options.source,
+          endpoint: options.endpoint,
+          tier: 'fallback',
+          asOf: fallbackResult.asOf,
+          isEstimated: fallbackResult.isEstimated,
+          issues: [`主接口失败: ${primaryMessage}`, ...(fallbackResult.issues || [])],
+        });
+        setCachedEntry(
+          options.cacheKey,
+          fallbackResult.data,
+          meta,
+          options.cacheTtlMs,
+          options.staleTtlMs ?? options.cacheTtlMs * 3
+        );
+        return { data: fallbackResult.data, meta };
+      } catch (fallbackError) {
+        const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+        const staleCache = getCachedEntry<T>(options.cacheKey, true);
+        if (staleCache) {
+          return {
+            data: staleCache.value,
+            meta: createMeta({
+              source: staleCache.meta.source,
+              endpoint: staleCache.meta.endpoint,
+              tier: 'cache',
+              asOf: staleCache.meta.asOf,
+              cacheHit: true,
+              stale: true,
+              isEstimated: staleCache.meta.isEstimated,
+              issues: [
+                `主接口失败: ${primaryMessage}`,
+                `回退接口失败: ${fallbackMessage}`,
+                '使用过期缓存兜底，请谨慎看待时效性',
+              ],
+            }),
+          };
+        }
+        throw new Error(`主接口失败: ${primaryMessage}; 回退接口失败: ${fallbackMessage}`);
+      }
+    }
+
+    const staleCache = getCachedEntry<T>(options.cacheKey, true);
+    if (staleCache) {
+      return {
+        data: staleCache.value,
+        meta: createMeta({
+          source: staleCache.meta.source,
+          endpoint: staleCache.meta.endpoint,
+          tier: 'cache',
+          asOf: staleCache.meta.asOf,
+          cacheHit: true,
+          stale: true,
+          isEstimated: staleCache.meta.isEstimated,
+          issues: [`公开接口失败: ${primaryMessage}`, '使用过期缓存兜底，请谨慎看待时效性'],
+        }),
+      };
+    }
+
+    throw primaryError;
+  }
+}
 
 // 定义数据接口（为了兼容性保持与之前一致）
 export interface StockSnapshot {
@@ -12,6 +388,7 @@ export interface StockSnapshot {
   turnoverRate?: number; // 换手率
   volumeRatio?: number; // 量比
   marketSentiment?: string; // 市场情绪 (衍生字段)
+  dataQuality?: DataQualityMeta;
 }
 
 export interface KlineData {
@@ -45,7 +422,10 @@ export interface StockHistory {
   bias5?: number | null; // MA5 乖离率
   bias10?: number | null;
   bias60?: number | null;
+  dataQuality?: DataQualityMeta;
 }
+
+export type AnalysisDataMode = 'postmarket';
 
 // 辅助函数：转换格式 "000933.SZ" -> "sz000933"
 function formatSymbolForTencent(symbol: string): string {
@@ -60,61 +440,89 @@ function formatSymbolForTencent(symbol: string): string {
 /**
  * 从腾讯 (qt.gtimg.cn) 获取股票快照
  */
-export async function fetchStockSnapshot(symbol: string): Promise<StockSnapshot> {
-  const tencentSymbol = formatSymbolForTencent(symbol);
-  const url = `http://qt.gtimg.cn/q=${tencentSymbol}`;
-
-  try {
-    const response = await axios.get(url, {
-      responseType: 'arraybuffer', // iconv-lite 解码需要
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-      }
-    });
-
-    // 解码 GBK 响应
-    const data = iconv.decode(response.data, 'gbk');
-    
-    // 响应格式: v_sz000933="51~神火股份~000933~17.20~17.36~17.15~190842~94239~96603~17.19~63~..."
-    // 通过 '"' 分割获取内容
-    const match = data.match(/="(.*)";/);
-    if (!match || !match[1]) {
-        // 处理股票不存在或响应为空的情况
-        if (data.includes('pv_none')) {
-             throw new Error(`未找到股票 ${symbol}。`);
-        }
-        throw new Error(`来自腾讯 API 的响应格式无效: ${data}`);
+function buildSnapshotFromTencentPayload(symbol: string, rawData: string): RequestResult<StockSnapshot> {
+  const match = rawData.match(/="(.*)";/);
+  if (!match || !match[1]) {
+    if (rawData.includes('pv_none')) {
+      throw new Error(`未找到股票 ${symbol}`);
     }
+    throw new Error(`来自腾讯 API 的响应格式无效: ${rawData}`);
+  }
 
-    const values = match[1].split('~');
-    
-    // 1: 名称, 2: 代码, 3: 现价, 32: 涨跌幅
-    const name = values[1];
-    const currentPrice = parseFloat(values[3]);
-    const changePercent = parseFloat(values[32]);
-    
-    // 索引 38: 换手率
-    // 索引 49: 量比 - 注意：索引可能会有变化，但通常在这里。
-    // 根据用户提供的日志: ...~31.77~30.80~3.11~706.39~706.86~2.95~34.27~28.04~0.69~-1256~...
-    // 假设 38 是换手率，49 是量比。
-    const turnoverRate = parseFloat(values[38]) || 0;
-    const volumeRatio = parseFloat(values[49]) || 0;
+  const values = match[1].split('~');
+  const name = values[1];
+  const currentPrice = parseFloat(values[3]);
+  const changePercent = parseFloat(values[32]);
+  const turnoverRate = Number.isFinite(parseFloat(values[38])) ? parseFloat(values[38]) : undefined;
+  const volumeRatio = Number.isFinite(parseFloat(values[49])) ? parseFloat(values[49]) : undefined;
 
-    // 基于涨跌幅的简单市场情绪
-    let marketSentiment = '震荡';
-    if (changePercent > 1.5) marketSentiment = '多头';
-    else if (changePercent < -1.5) marketSentiment = '空头';
+  if (!Number.isFinite(currentPrice)) {
+    throw new Error(`快照现价字段无效: ${values[3]}`);
+  }
 
-    return {
+  let marketSentiment = '震荡';
+  if (changePercent > 1.5) marketSentiment = '多头';
+  else if (changePercent < -1.5) marketSentiment = '空头';
+
+  const issues: string[] = [];
+  if (turnoverRate === undefined) issues.push('腾讯快照未返回换手率');
+  if (volumeRatio === undefined) issues.push('腾讯快照未返回量比');
+
+  return {
+    data: {
       symbol,
       name,
       price: currentPrice,
-      changePercent,
+      changePercent: Number.isFinite(changePercent) ? changePercent : 0,
       turnoverRate,
       volumeRatio,
-      marketSentiment
-    };
+      marketSentiment,
+    },
+    issues,
+    asOf: new Date().toISOString().slice(0, 10),
+  };
+}
 
+export async function fetchStockSnapshot(
+  symbol: string,
+  mode: AnalysisDataMode = 'postmarket'
+): Promise<StockSnapshot> {
+  const tencentSymbol = formatSymbolForTencent(symbol);
+  const url = `http://qt.gtimg.cn/q=${tencentSymbol}`;
+  try {
+    const { data, meta } = await fetchWithPublicApiResilience<StockSnapshot>({
+      cacheKey: `snapshot:${symbol}:${mode}`,
+      endpoint: `tushare://snapshot/${symbol}`,
+      source: 'Tushare snapshot bridge',
+      cacheTtlMs: CACHE_TTLS.snapshot,
+      requestFn: async () => {
+        const result = await runTushareBridge<StockSnapshot>('snapshot', { symbol });
+        return {
+          data: {
+            ...result.data,
+            changePercent: Number(result.data.changePercent),
+            price: Number(result.data.price),
+          },
+          issues: result.issues,
+          asOf: formatBridgeDate(result.asOf),
+          isEstimated: result.isEstimated,
+        };
+      },
+      fallbackFn: async () => {
+        const response = await axios.get(url, {
+          responseType: 'arraybuffer',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+          }
+        });
+        return buildSnapshotFromTencentPayload(symbol, iconv.decode(response.data, 'gbk'));
+      },
+    });
+
+    return {
+      ...data,
+      dataQuality: meta,
+    };
   } catch (error) {
     console.error(`获取 ${symbol} 快照时出错:`, error);
     throw error;
@@ -133,99 +541,133 @@ export async function fetchStockHistory(symbol: string): Promise<StockHistory> {
   const url = `http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=${tencentSymbol},day,,,${count},qfq`;
 
   try {
-    const response = await axios.get(url);
-    const data = response.data;
+    const { data: history, meta } = await fetchWithPublicApiResilience<StockHistory>({
+      cacheKey: `history:${symbol}`,
+      endpoint: `tushare://history/${symbol}`,
+      source: 'Tushare pro_bar bridge',
+      cacheTtlMs: CACHE_TTLS.history,
+      requestFn: async () => {
+        const result = await runTushareBridge<Array<{
+          date: string;
+          open: number;
+          high: number;
+          low: number;
+          close: number;
+          volume: number;
+        }>>('history', { symbol, limit: count });
 
-    if (data.code !== 0) {
-      throw new Error(`腾讯 K线 API 错误: ${data.msg}`);
-    }
+        const klines: KlineData[] = result.data.map((item) => ({
+          date: formatBridgeDate(item.date) || item.date,
+          open: Number(item.open),
+          close: Number(item.close),
+          high: Number(item.high),
+          low: Number(item.low),
+          volume: Number(item.volume),
+        })).filter((item: KlineData) => Number.isFinite(item.close));
 
-    // 路径: data.data[symbol].day
-    // 但响应中的 symbol 键可能是 "sz000933" 或其内部的 "qfqday"
-    // 实际结构: data.data.sz000933.day 或 data.data.sz000933.qfqday (如果使用了 qfq)
-    
-    const stockData = data.data[tencentSymbol];
-    if (!stockData) {
-        throw new Error(`未找到 ${symbol} 的数据`);
-    }
+        if (klines.length === 0) {
+          throw new Error(`Tushare bridge 未返回有效K线: ${symbol}`);
+        }
 
-    // 通常 'day' 包含原始数据，'qfqday' 包含请求的复权数据。
-    // 参数 'qfq' 通常会返回 'qfqday'，但有时是混合的。
-    // 先检查 'qfqday'，然后是 'day'。
-    const klineList = stockData.qfqday || stockData.day || [];
+        const issues: string[] = [...(result.issues || [])];
+        if (klines.length < count) {
+          issues.push(`K线样本不足，目标${count}条，实际${klines.length}条`);
+        }
 
-    // 映射到 KlineData
-    // 腾讯格式: ["2023-01-01", "open", "close", "high", "low", "volume"]
-    const klines: KlineData[] = klineList.map((item: any[]) => ({
-      date: item[0],
-      open: parseFloat(item[1]),
-      close: parseFloat(item[2]),
-      high: parseFloat(item[3]),
-      low: parseFloat(item[4]),
-      volume: parseFloat(item[5])
-    }));
+        return {
+          data: {
+            symbol,
+            klines,
+            ma5: calculateMA(klines, 5),
+            ma10: calculateMA(klines, 10),
+            ma20: calculateMA(klines, 20),
+            ma60: calculateMA(klines, 60),
+            ma120: calculateMA(klines, 120),
+            atr14: calculateATR(klines, 14),
+            fibSupport: calculateFibonacciSupport(klines, 60),
+            rsi: calculateRSI(klines, 14),
+            rsi6: calculateRSI(klines, 6),
+            kdj: calculateKDJ(klines),
+            macd: calculateMACD(klines),
+            boll: calculateBOLL(klines, 20, 2),
+            volumeTrend: analyzeVolumeTrend(klines),
+            ma5Slope: calculateSlope(klines, 5),
+            ma10Slope: calculateSlope(klines, 10),
+            ma20Slope: calculateSlope(klines, 20),
+            bias5: calculateBias(klines, 5),
+            bias10: calculateBias(klines, 10),
+            bias60: calculateBias(klines, 60),
+          },
+          issues,
+          asOf: formatBridgeDate(result.asOf) || klines[klines.length - 1]?.date,
+          isEstimated: result.isEstimated,
+        };
+      },
+      fallbackFn: async () => {
+        const response = await axios.get(url);
+        const data = response.data;
 
-    // 计算均线 (MA)
-    const ma5 = calculateMA(klines, 5);
-    const ma10 = calculateMA(klines, 10);
-    const ma20 = calculateMA(klines, 20);
-    const ma60 = calculateMA(klines, 60);
-    const ma120 = calculateMA(klines, 120);
-    
-    // 计算 ATR (14)
-    const atr14 = calculateATR(klines, 14);
-    
-    // 计算黄金分割支撑 (0.618)
-    const fibSupport = calculateFibonacciSupport(klines, 60);
+        if (data.code !== 0) {
+          throw new Error(`腾讯 K线 API 错误: ${data.msg}`);
+        }
 
-    // 计算 RSI (14, 6)
-    const rsi = calculateRSI(klines, 14);
-    const rsi6 = calculateRSI(klines, 6);
+        const stockData = data.data[tencentSymbol];
+        if (!stockData) {
+          throw new Error(`未找到 ${symbol} 的历史数据`);
+        }
 
-    // 计算 KDJ
-    const kdj = calculateKDJ(klines);
+        const klineList = stockData.qfqday || stockData.day || [];
+        const klines: KlineData[] = klineList.map((item: any[]) => ({
+          date: item[0],
+          open: parseFloat(item[1]),
+          close: parseFloat(item[2]),
+          high: parseFloat(item[3]),
+          low: parseFloat(item[4]),
+          volume: parseFloat(item[5])
+        })).filter((item: KlineData) => Number.isFinite(item.close));
 
-    // 计算 MACD
-    const macd = calculateMACD(klines);
+        if (klines.length === 0) {
+          throw new Error(`腾讯 K线接口未返回有效K线: ${symbol}`);
+        }
 
-    // 计算 BOLL (20, 2)
-    const boll = calculateBOLL(klines, 20, 2);
+        const issues: string[] = [];
+        if (klines.length < count) {
+          issues.push(`K线样本不足，目标${count}条，实际${klines.length}条`);
+        }
 
-    // 计算量能趋势
-    const volumeTrend = analyzeVolumeTrend(klines);
-
-    // 计算斜率 (Slope)
-    const ma5Slope = calculateSlope(klines, 5);
-    const ma10Slope = calculateSlope(klines, 10);
-    const ma20Slope = calculateSlope(klines, 20);
-
-    // 计算乖离率 (BIAS)
-    const bias5 = calculateBias(klines, 5);
-    const bias10 = calculateBias(klines, 10);
-    const bias60 = calculateBias(klines, 60);
+        return {
+          data: {
+            symbol,
+            klines,
+            ma5: calculateMA(klines, 5),
+            ma10: calculateMA(klines, 10),
+            ma20: calculateMA(klines, 20),
+            ma60: calculateMA(klines, 60),
+            ma120: calculateMA(klines, 120),
+            atr14: calculateATR(klines, 14),
+            fibSupport: calculateFibonacciSupport(klines, 60),
+            rsi: calculateRSI(klines, 14),
+            rsi6: calculateRSI(klines, 6),
+            kdj: calculateKDJ(klines),
+            macd: calculateMACD(klines),
+            boll: calculateBOLL(klines, 20, 2),
+            volumeTrend: analyzeVolumeTrend(klines),
+            ma5Slope: calculateSlope(klines, 5),
+            ma10Slope: calculateSlope(klines, 10),
+            ma20Slope: calculateSlope(klines, 20),
+            bias5: calculateBias(klines, 5),
+            bias10: calculateBias(klines, 10),
+            bias60: calculateBias(klines, 60),
+          },
+          issues,
+          asOf: klines[klines.length - 1]?.date,
+        };
+      }
+    });
 
     return {
-      symbol,
-      klines,
-      ma5,
-      ma10,
-      ma20,
-      ma60,
-      ma120,
-      atr14,
-      fibSupport,
-      rsi,
-      rsi6,
-      kdj,
-      macd,
-      boll,
-      volumeTrend,
-      ma5Slope,
-      ma10Slope,
-      ma20Slope,
-      bias5,
-      bias10,
-      bias60
+      ...history,
+      dataQuality: meta,
     };
   } catch (error) {
     console.error(`获取 ${symbol} 历史数据时出错:`, error);
@@ -542,9 +984,16 @@ function calculateMACD(klines: KlineData[]): { diff: number, dea: number, macd: 
 
 // 辅助函数：搜索股票 (使用腾讯 Smartbox API)
 export async function searchStocks(query: string): Promise<Array<{ symbol: string; name: string }>> {
-    // 腾讯 Smartbox API: http://smartbox.gtimg.cn/s3/?t=all&q=
-    // 返回: v_hint="sz000933~神火股份~000933~SHGF~GP-A~1";
-    
+    try {
+        const result = await runTushareBridge<Array<{ symbol: string; name: string }>>('search', { query, limit: 20 });
+        return result.data.map((item) => ({
+            symbol: item.symbol,
+            name: item.name,
+        }));
+    } catch (error) {
+        console.error('Tushare 搜索股票出错，回退到腾讯 Smartbox:', error);
+    }
+
     const url = `http://smartbox.gtimg.cn/s3/?t=all&q=${encodeURIComponent(query)}`;
     
     try {
@@ -555,76 +1004,39 @@ export async function searchStocks(query: string): Promise<Array<{ symbol: strin
             }
         });
 
-        // 解码 GBK 响应 (Smartbox 通常返回 GBK)
         const data = iconv.decode(response.data, 'gbk');
-        
-        // 解析格式: v_hint="code~name~code_short~pinyin~type~?";
-        // 注意：Tencent Smartbox 有时返回的数据可能包含 unicode 转义字符，如 \u96f6
-        // 或者是直接的中文。
-        // data 示例: v_hint="hk~00093~\u96f6...~lzkjjr~GP^sh~..."
-        // 需要处理 unicode 转义
-        
         const unescapedData = data.replace(/\\u([\d\w]{4})/gi, (match, grp) => {
             return String.fromCharCode(parseInt(grp, 16));
         });
 
-        const match = unescapedData.match(/="(.*)"/); // 从正则中移除了末尾的分号
+        const match = unescapedData.match(/="(.*)"/);
         if (!match || !match[1]) return [];
 
-        // "sz000933~神火股份~000933~SHGF~GP-A~1^sh600..."
         const items = match[1].split('^');
         
         return items.map(item => {
             const parts = item.split('~');
-            // parts[0]: sz000933 (市场+代码) 或 hk~00093 或 sh~000938
-            // 腾讯返回格式不完全统一，有几种情况：
-            // 1. "sz000933~神火股份~000933~..." (A股常见)
-            // 2. "sh~600519~贵州茅台~..." (这种中间带分隔符)
-            // 3. "hk~00700~腾讯控股~..." (港股)
-            
-            // 我们主要关注 A 股 (GP-A) 或 指数 (ZS) 且是 A 股市场的
-            
             let market = '';
             let code = '';
             let name = '';
             let type = '';
-
-            // 尝试智能解析
-            // 如果 parts[0] 包含 'sz' 或 'sh' 且长度 > 2 (如 sz000933)，这是旧格式
-            // 如果 parts[0] 是 'sz' 或 'sh' (如 sh~600519)，这是新格式
             
             if (parts[0] === 'sh' || parts[0] === 'sz') {
                 market = parts[0];
                 code = parts[1];
                 name = parts[2];
-                // parts[4] 可能是 type
-                // 观察返回: sh~000933~中证医药~zzyy~ZS
-                // parts[4] 是 ZS
                 type = parts[4];
             } else {
-                // 旧格式或直接拼接格式: sz000933~神火股份~000933~...
-                // parts[0]: sz000933
-                // parts[1]: 神火股份
-                // parts[2]: 000933
                 const m = parts[0].match(/([a-z]+)(\d+)/);
                 if (m) {
                     market = m[1];
                     code = m[2];
                 }
                 name = parts[1];
-                type = parts[4]; // 通常是 GP-A
+                type = parts[4];
             }
-
-            // 过滤：只保留 A 股 (GP-A) 或 A 股指数
-            // 根据用户需求，主要是股票，所以重点保留 GP-A
-            // 如果用户想搜指数，也可以放开
-            // 观察日志: sh~000933~中证医药~zzyy~ZS (这是指数)
-            // sz~000933~神火股份~shgf~GP-A (这是股票)
             
-            if (type !== 'GP-A' && type !== 'GP') { 
-                // 严格模式：只看股票。如果需要指数，可以加上 || type === 'ZS'
-                // 但 000933 既是指数也是股票代码，这会造成混淆。
-                // 用户的意图通常是买卖个股，所以优先展示 GP-A
+            if (type !== 'GP-A' && type !== 'GP') {
                 return null;
             }
 
@@ -634,7 +1046,7 @@ export async function searchStocks(query: string): Promise<Array<{ symbol: strin
             } else if (market === 'sh') {
                 symbol = `${code}.SH`;
             } else {
-                return null; // 忽略港股、美股等
+                return null;
             }
 
             return {
@@ -643,8 +1055,8 @@ export async function searchStocks(query: string): Promise<Array<{ symbol: strin
             };
         }).filter((item): item is { symbol: string; name: string } => item !== null);
 
-    } catch (error) {
-        console.error('搜索股票出错:', error);
+    } catch (fallbackError) {
+        console.error('搜索股票出错:', fallbackError);
         return [];
     }
 }
@@ -659,33 +1071,43 @@ export async function searchStocks(query: string): Promise<Array<{ symbol: strin
  * @returns 行业名称 (e.g. "有色金属")
  */
 export async function fetchStockSector(symbol: string): Promise<string> {
-    // 1. 格式转换
-    // 东方财富格式: SZ(0) -> 0.000933, SH(1) -> 1.600519
-    let secid = '';
-    if (symbol.endsWith('.SZ')) {
-        secid = `0.${symbol.replace('.SZ', '')}`;
-    } else if (symbol.endsWith('.SH')) {
-        secid = `1.${symbol.replace('.SH', '')}`;
-    } else {
-        return '未知行业';
-    }
+    const secid = toSecid(symbol);
+    if (!secid) return '未知行业';
 
-    // 2. 调用接口
-    // fields=f127: 行业名称
     const url = `http://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=f127&secid=${secid}`;
 
     try {
-        const response = await axios.get(url);
-        const data = response.data;
-
-        // 3. 解析响应: {"data": {"f127": "有色金属"}}
-        if (data && data.data && data.data.f127) {
-            return data.data.f127;
-        }
-        return '未知行业';
+        const { data } = await fetchWithPublicApiResilience<string>({
+            cacheKey: `sector:${symbol}`,
+            endpoint: `tushare://sector/${symbol}`,
+            source: 'Tushare sector bridge',
+            cacheTtlMs: CACHE_TTLS.sector,
+            requestFn: async () => {
+                const result = await runTushareBridge<string>('sector', { symbol });
+                return {
+                    data: result.data || '未知行业',
+                    asOf: formatBridgeDate(result.asOf),
+                    issues: result.issues,
+                    isEstimated: result.isEstimated,
+                };
+            },
+            fallbackFn: async () => {
+                const response = await requestEastMoney(url);
+                const payload = response.data;
+                if (payload && payload.data && payload.data.f127) {
+                    return { data: payload.data.f127 };
+                }
+                return {
+                    data: '未知行业',
+                    isEstimated: true,
+                    issues: ['东方财富行业接口未返回 f127，已降级为未知行业'],
+                };
+            },
+        });
+        return data;
     } catch (error) {
         console.error(`获取行业信息失败 ${symbol}:`, error);
-        return '未知行业'; // 发生错误时降级处理
+        return '未知行业';
     }
 }
 
@@ -701,7 +1123,6 @@ export interface SectorData {
  */
 export async function fetchIndustryRank(limit: number = 20): Promise<SectorData[]> {
     const url = 'http://push2.eastmoney.com/api/qt/clist/get';
-    // f12: code, f14: name, f3: changePercent
     const fields = 'f12,f14,f3';
 
     const params = {
@@ -718,18 +1139,42 @@ export async function fetchIndustryRank(limit: number = 20): Promise<SectorData[
     };
 
     try {
-        const response = await axios.get(url, { params });
-        const data = response.data?.data?.diff;
+        const { data } = await fetchWithPublicApiResilience<SectorData[]>({
+            cacheKey: `industry-rank:${limit}`,
+            endpoint: `tushare://industry_rank/${limit}`,
+            source: 'Tushare industry rank bridge',
+            cacheTtlMs: CACHE_TTLS.industryRank,
+            requestFn: async () => {
+                const result = await runTushareBridge<SectorData[]>('industry_rank', { limit });
+                return {
+                    data: result.data,
+                    asOf: formatBridgeDate(result.asOf),
+                    issues: result.issues,
+                    isEstimated: result.isEstimated,
+                };
+            },
+            fallbackFn: async () => {
+                const response = await requestEastMoney(url, params);
+                const data = response.data?.data?.diff;
 
-        if (!data || !Array.isArray(data)) {
-            return [];
-        }
+                if (!data || !Array.isArray(data)) {
+                    return {
+                        data: [],
+                        issues: ['东方财富行业排行接口未返回 diff 数组'],
+                    };
+                }
 
-        return data.map((item: any) => ({
-            code: item.f12,
-            name: item.f14,
-            changePercent: item.f3
-        }));
+                return {
+                    data: data.map((item: any) => ({
+                        code: item.f12,
+                        name: item.f14,
+                        changePercent: item.f3
+                    })),
+                };
+            },
+        });
+
+        return data;
     } catch (error) {
         console.error('获取行业板块排行失败:', error);
         return [];
@@ -750,18 +1195,20 @@ export interface FinancialData {
     revenueYoY: number;  // 营收同比
     profitYoY: number;   // 净利同比
     marketCap: number;   // 总市值 (新增)
+    dataQuality?: DataQualityMeta;
 }
 
 export interface FundFlowData {
     date: string;
-    mainNetInflow: number; // 主力净流入 (元)
-    mainNetInflowRate: number; // 主力净流入占比 (%)
-    superLargeInflow: number; // 超大单流入
-    largeInflow: number; // 大单流入
-    mediumInflow: number; // 中单流入 (新增)
-    smallInflow: number; // 小单流入 (新增)
-    close: number; // 当日收盘价 (新增，用于量价分析)
-    changePercent: number; // 当日涨跌幅 (新增，用于量价分析)
+    mainNetInflow: number; // 主力净流入 (万元)
+    mainNetInflowRate: number | null; // 主力净流入占比 (%)
+    superLargeInflow: number; // 超大单流入 (万元)
+    largeInflow: number; // 大单流入 (万元)
+    mediumInflow: number | null; // 中单流入 (万元)
+    smallInflow: number | null; // 小单流入 (万元)
+    close: number | null; // 当日收盘价 (新增，用于量价分析)
+    changePercent: number | null; // 当日涨跌幅 (新增，用于量价分析)
+    dataQuality?: DataQualityMeta;
 }
 
 /**
@@ -769,36 +1216,57 @@ export interface FundFlowData {
  * @param symbol 股票代码
  */
 export async function fetchFinancialData(symbol: string): Promise<FinancialData | null> {
-    // 格式转换
-    let secid = '';
-    if (symbol.endsWith('.SZ')) {
-        secid = `0.${symbol.replace('.SZ', '')}`;
-    } else if (symbol.endsWith('.SH')) {
-        secid = `1.${symbol.replace('.SH', '')}`;
-    } else {
-        return null;
-    }
+    const secid = toSecid(symbol);
+    if (!secid) return null;
 
-    // f162: PE(动), f167: PB, f173: ROE, f186: 毛利率, f187: 净利率, f188: 负债率, f184: 营收同比, f185: 净利同比, f116: 总市值
     const fields = 'f162,f167,f173,f186,f187,f188,f184,f185,f116';
     const url = `http://push2.eastmoney.com/api/qt/stock/get?ut=fa5fd1943c7b386f172d6893dbfba10b&fltt=2&invt=2&fields=${fields}&secid=${secid}`;
 
     try {
-        const response = await axios.get(url);
-        const data = response.data?.data;
+        const { data, meta } = await fetchWithPublicApiResilience<Omit<FinancialData, 'dataQuality'>>({
+            cacheKey: `financial:${symbol}`,
+            endpoint: `tushare://financial/${symbol}`,
+            source: 'Tushare financial bridge',
+            cacheTtlMs: CACHE_TTLS.financial,
+            requestFn: async () => {
+                const result = await runTushareBridge<Omit<FinancialData, 'dataQuality'> & {
+                    turnoverRate?: number | null;
+                    volumeRatio?: number | null;
+                }>('financial', { symbol });
 
-        if (!data) return null;
+                return {
+                    data: result.data,
+                    asOf: formatBridgeDate(result.asOf),
+                    issues: result.issues,
+                    isEstimated: result.isEstimated,
+                };
+            },
+            fallbackFn: async () => {
+                const response = await requestEastMoney(url);
+                const data = response.data?.data;
 
+                if (!data) {
+                    throw new Error('东方财富财务接口未返回 data 节点');
+                }
+
+                return {
+                    data: {
+                        pe: data.f162 || 0,
+                        pb: data.f167 || 0,
+                        roe: data.f173 || 0,
+                        grossMargin: data.f186 || 0,
+                        netMargin: data.f187 || 0,
+                        debtRatio: data.f188 || 0,
+                        revenueYoY: data.f184 || 0,
+                        profitYoY: data.f185 || 0,
+                        marketCap: data.f116 || 0
+                    },
+                };
+            },
+        });
         return {
-            pe: data.f162 || 0, // 修正：东方财富接口返回的 f162 已经是实际值，无需除以 100
-            pb: data.f167 || 0, // 修正：同上
-            roe: data.f173 || 0,
-            grossMargin: data.f186 || 0,
-            netMargin: data.f187 || 0,
-            debtRatio: data.f188 || 0,
-            revenueYoY: data.f184 || 0,
-            profitYoY: data.f185 || 0,
-            marketCap: data.f116 || 0 // 总市值
+            ...data,
+            dataQuality: meta,
         };
     } catch (error) {
         console.error(`获取基本面数据失败 ${symbol}:`, error);
@@ -806,36 +1274,55 @@ export async function fetchFinancialData(symbol: string): Promise<FinancialData 
     }
 }
 
-    // 移除无效的新浪代码，专注于优化东方财富的数据处理
+/**
+ * 获取个股资金流向数据
+ * 优先走 Tushare，失败后回退到东方财富近 30 日资金流。
+ */
+export async function fetchFundFlowData(symbol: string): Promise<FundFlowData[]> {
+    const market = toMarketCode(symbol);
+    const code = toPlainCode(symbol);
+    if (!market) return [];
 
-    /**
-     * 获取个股资金流向数据 (近20日)
-     * @param symbol 股票代码
-     */
-    export async function fetchFundFlowData(symbol: string): Promise<FundFlowData[]> {
-        // 直接使用东方财富接口
-        return await fetchFundFlowFromEastMoney(symbol);
+    try {
+        const { data, meta } = await fetchWithPublicApiResilience<FundFlowData[]>({
+            cacheKey: `fundflow:${symbol}`,
+            endpoint: `tushare://fundflow/${symbol}`,
+            source: 'Tushare moneyflow bridge',
+            cacheTtlMs: CACHE_TTLS.fundFlow,
+            requestFn: async () => {
+                const result = await runTushareBridge<FundFlowData[]>('fundflow', { symbol, code, market, limit: 30 });
+                return {
+                    data: result.data.map((record) => ({
+                        ...record,
+                        date: formatBridgeDate(record.date) || record.date,
+                    })),
+                    asOf: formatBridgeDate(result.asOf),
+                    issues: result.issues,
+                    isEstimated: result.isEstimated,
+                };
+            },
+            fallbackFn: async () => fetchFundFlowFromEastMoney(symbol),
+        });
+
+        return data.map((record) => ({
+            ...record,
+            dataQuality: record.dataQuality || meta,
+        }));
+    } catch (error) {
+        console.error(`获取资金流向失败 ${symbol}:`, error);
+        return [];
     }
+}
     
-    async function fetchFundFlowFromEastMoney(symbol: string): Promise<FundFlowData[]> {
-        let secid = '';
-        if (symbol.endsWith('.SZ')) {
-            secid = `0.${symbol.replace('.SZ', '')}`;
-        } else if (symbol.endsWith('.SH')) {
-            secid = `1.${symbol.replace('.SH', '')}`;
-        } else {
-            return [];
-        }
-    
-        // 东方财富字段顺序: date, f51, f52, f53, f54, f55, f56
+async function fetchFundFlowFromEastMoney(symbol: string): Promise<RequestResult<FundFlowData[]>> {
+        const secid = toSecid(symbol);
+        if (!secid) return { data: [] };
+
     const urlHis = 'http://push2his.eastmoney.com/api/qt/stock/fflow/kline/get';
     const urlReal = 'http://push2.eastmoney.com/api/qt/stock/fflow/kline/get'; // 回退接口
     
-    // 经过详细测试 (probe_fields.ts):
-    // 1. push2his 接口仅返回主力(f51)、超大(f53)、大单(f55)。
-    // 2. 中单(f57)和小单(f59)在该接口中数据缺失 (返回空或截断)。
-    // 3. 单独请求 f57 或 f59 也会返回 No Data。
-    // 因此，我们必须使用【主力反推散户】的逻辑来补全数据，否则 AI 会一直报错数据缺失。
+    // 经过测试，东方财富资金流接口经常缺少中单/小单或价格字段。
+    // 这里保留缺失值并把问题写进 dataQuality，避免再做伪造反推。
     
     const params = {
         lmt: 0, // 0 获取所有数据
@@ -845,110 +1332,67 @@ export async function fetchFinancialData(symbol: string): Promise<FinancialData 
         secid: secid
     };
 
-    const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Referer': 'http://quote.eastmoney.com/',
-        'Connection': 'close' // 尝试禁用 keep-alive
-    };
-
-    // Axios 配置，禁用 keep-alive，强制 IPv4
-    const axiosConfig: any = {
-        params,
-        headers,
-        httpAgent: new http.Agent({ keepAlive: false }),
-        httpsAgent: new https.Agent({ keepAlive: false }),
-        timeout: 5000, // 5秒超时
-        family: 4 // 强制使用 IPv4，解决 socket hang up 问题
-    };
-
-    let klines: any[] = [];
-
-    try {
-        // 尝试 1: push2his (历史数据)
-        const response = await axios.get(urlHis, axiosConfig);
-        klines = response.data?.data?.klines;
-    } catch (error) {
-        console.warn(`push2his 接口失败，尝试回退到 push2:`, error instanceof Error ? error.message : String(error));
-        try {
-            // 尝试 2: push2 (实时/近期数据)
-            const response = await axios.get(urlReal, axiosConfig);
-            klines = response.data?.data?.klines;
-        } catch (err2) {
-             console.error(`push2 接口也失败了:`, err2 instanceof Error ? err2.message : String(err2));
-             return [];
-        }
-    }
-
+    const response = await requestEastMoney(urlHis, params).catch(async () => requestEastMoney(urlReal, params));
+    const klines = response.data?.data?.klines;
     if (!klines || !Array.isArray(klines)) {
-        return [];
+        throw new Error('东方财富资金流接口未返回 klines');
     }
+    return parseEastMoneyFundFlowKlines(klines);
+}
 
-    // 格式: "date, f51, f53, f55, f57, f59, f2, f3"
-    // 注意：根据测试，实际返回可能是 "date, f51, f53, f55" (后面截断)
-    return klines.map((item: string) => {
+function parseEastMoneyFundFlowKlines(klines: string[]): RequestResult<FundFlowData[]> {
+    const issues: string[] = [];
+
+    const records = klines.map((item: string) => {
         const parts = item.split(',');
-        
-        // 解析主力资金 (f51)
-        // 经测试，f51 似乎没有单独返回，而是只有 f53 和 f55？
-        // 再次查看 probe 输出: 
-        // [主力+超大+大] Fields [f51,f53,f55] => 2026-01-23,-97931728.0,118015823.0
-        // parts[0]: date
-        // parts[1]: f51 ? NO. -97931728 是超大单还是主力？
-        // 单独测 f53 => -97931728.0
-        // 所以 parts[1] 是 f53 (超大单)
-        // parts[2] 是 f55 (大单) 118015823.0
-        // f51 (主力) = f53 + f55 = -9793w + 11801w = +2008w ?
-        // 让我们确认 f51 是否返回。
-        // probe [f51] => 2026-01-23 (后面没了?)
-        // 看来 f51 在 kline 接口里可能是计算字段，或者没返回数值。
-        // 但是通常主力 = 超大 + 大。
-        
-        // 修正解析逻辑：
-        // 根据 probe 结果: "2026-01-23,-97931728.0,118015823.0" (对应请求 f51,f53,f55)
-        // 看起来 f51 被跳过了？或者 f51 就是 date？不可能。
-        // 更有可能的是：f51 没数据，或者 parts[1] 是 f53。
-        // 让我们假设：
-        // parts[1] = f53 (超大)
-        // parts[2] = f55 (大单)
-        // 主力 = f53 + f55
-        
-        const superLarge = parseFloat(parts[1]) || 0;
-        const large = parseFloat(parts[2]) || 0;
-        const main = superLarge + large; // 自动计算主力
+        const superLarge = Number.isFinite(parseFloat(parts[1])) ? parseFloat(parts[1]) : 0;
+        const large = Number.isFinite(parseFloat(parts[2])) ? parseFloat(parts[2]) : 0;
+        const medium = Number.isFinite(parseFloat(parts[3])) ? parseFloat(parts[3]) : null;
+        const small = Number.isFinite(parseFloat(parts[4])) ? parseFloat(parts[4]) : null;
+        const close = Number.isFinite(parseFloat(parts[5])) ? parseFloat(parts[5]) : null;
+        const changePercent = Number.isFinite(parseFloat(parts[6])) ? parseFloat(parts[6]) : null;
+        const mainNetInflow = superLarge + large;
 
-        // 中单和小单通常缺失，需要反推
-        let medium = parseFloat(parts[3]) || 0; 
-        let small = parseFloat(parts[4]) || 0;
-        
-        // 尝试获取收盘价和涨跌幅 (如果截断了，这里就是 0)
-        // 根据请求 fields2='...,f2,f3'，如果中间缺失，f2/f3 可能在 parts[3]/[4] ?
-        // 不，东方财富通常是按请求顺序，如果没数据就省略。
-        // 所以如果 f57, f59 没数据，parts[3] 可能是 f2 ?
-        // 为了稳健，我们应该从 AI Engine 层去补全价格，这里尽力解析。
-        // 暂时假设 parts[3] 可能是 medium，也可能是 close。这很危险。
-        // 安全起见，我们只信任前两个数据 (超大、大单)。
-        
-        const close = 0; // 交给 aiEngine 补全
-        const changePercent = 0; // 交给 aiEngine 补全
-
-        // 【必须启用】基于主力资金进行反向估算，否则 AI 会报错数据缺失
-        if (medium === 0 && small === 0 && main !== 0) {
-            const retailNetInflow = -main;
-            // 经验分布：散户资金中，小单通常占大头
-            medium = retailNetInflow * 0.4;
-            small = retailNetInflow * 0.6;
+        const rowIssues: string[] = [];
+        if (parts.length <= 3) {
+            rowIssues.push('接口仅返回超大单和大单，缺少中小单明细');
         }
+        if (medium === null) rowIssues.push('中单缺失');
+        if (small === null) rowIssues.push('小单缺失');
+        if (close === null) rowIssues.push('资金流接口未返回收盘价');
+        if (changePercent === null) rowIssues.push('资金流接口未返回涨跌幅');
 
         return {
             date: parts[0],
-            mainNetInflow: main,
-            mainNetInflowRate: 0,
+            mainNetInflow,
+            mainNetInflowRate: null,
             superLargeInflow: superLarge,
-            largeInflow: large,   
-            mediumInflow: medium,  
+            largeInflow: large,
+            mediumInflow: medium,
             smallInflow: small,
-            close: close,
-            changePercent: changePercent
-        };
-    }).slice(-30); // 只取最近30天
+            close,
+            changePercent,
+            dataQuality: createMeta({
+                source: 'EastMoney fflow/kline',
+                endpoint: 'fflow row',
+                tier: 'primary',
+                asOf: parts[0],
+                isEstimated: false,
+                issues: rowIssues,
+            }),
+        } as FundFlowData;
+    }).slice(-30);
+
+    if (records.some((record) => record.mediumInflow === null || record.smallInflow === null)) {
+        issues.push('资金流接口缺少中单/小单明细，已按缺失处理，不再反推伪造');
     }
+    if (records.every((record) => record.close === null || record.changePercent === null)) {
+        issues.push('资金流接口缺少价格字段，需要由K线数据补全价格背景');
+    }
+
+    return {
+        data: records,
+        issues,
+        asOf: records[records.length - 1]?.date,
+    };
+}

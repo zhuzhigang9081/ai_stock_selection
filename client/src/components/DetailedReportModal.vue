@@ -18,6 +18,8 @@
                     {{ data.stockName }} 
                     <span class="w-1 h-1 rounded-full bg-slate-600"></span>
                     {{ new Date().toLocaleDateString() }}
+                    <span v-if="data.analysisModeLabel" class="w-1 h-1 rounded-full bg-slate-600"></span>
+                    <span v-if="data.analysisModeLabel">{{ data.analysisModeLabel }}</span>
                 </p>
             </div>
         </div>
@@ -32,6 +34,11 @@
       <!-- Scrollable Content -->
       <div class="flex-1 overflow-y-auto p-6 sm:p-10 custom-scrollbar bg-slate-900/30">
         <article class="prose prose-invert prose-slate max-w-none">
+            <section v-if="data.analysisDisclaimer" class="mb-10">
+                <div class="rounded-xl border border-emerald-500/20 bg-emerald-500/10 p-5 text-emerald-50">
+                    <p class="m-0 text-sm leading-relaxed">{{ data.analysisDisclaimer }}</p>
+                </div>
+            </section>
             
             <!-- 1. Executive Summary -->
             <section class="mb-10">
@@ -54,6 +61,80 @@
                         <div>
                             <span class="block text-emerald-400 mb-1 font-bold">预期收益</span>
                             <span class="text-slate-300 font-mono">{{ data.executiveSummary?.expectedReturn }}</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section v-if="qualitySections.length > 0" class="mb-10">
+                <h3 class="flex items-center gap-2 text-2xl font-bold text-slate-100 mb-6 pb-2 border-b border-slate-700/50">
+                    <Info class="w-6 h-6 text-cyan-400" />
+                    数据质量与接口状态
+                </h3>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div
+                        v-for="section in qualitySections"
+                        :key="section.key"
+                        class="rounded-xl border p-5"
+                        :class="section.panelClass"
+                    >
+                        <div class="flex items-center justify-between gap-3 mb-3">
+                            <h4 class="m-0 text-base font-bold text-slate-100">{{ section.label }}</h4>
+                            <span class="text-xs font-mono px-2 py-1 rounded border" :class="section.badgeClass">
+                                {{ section.scoreText }}
+                            </span>
+                        </div>
+                        <div class="space-y-2 text-sm text-slate-300">
+                            <p class="m-0">来源: {{ section.source }}</p>
+                            <p class="m-0">日期: {{ formatAsOf(section.asOf) }}</p>
+                            <p class="m-0">链路: {{ section.tierText }}</p>
+                            <p class="m-0">状态: {{ section.flagsText }}</p>
+                            <p v-if="section.extraText" class="m-0 text-amber-300">{{ section.extraText }}</p>
+                        </div>
+                        <div v-if="section.issues.length > 0" class="mt-4 pt-4 border-t border-slate-700/60 space-y-2">
+                            <p
+                                v-for="issue in section.issues"
+                                :key="issue"
+                                class="m-0 text-sm text-slate-300 leading-relaxed"
+                            >
+                                {{ issue }}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section v-if="data.continuity?.previousReport || data.continuity?.continuityNote" class="mb-10">
+                <h3 class="flex items-center gap-2 text-2xl font-bold text-slate-100 mb-6 pb-2 border-b border-slate-700/50">
+                    <GitFork class="w-6 h-6 text-amber-400" />
+                    连续分析上下文
+                </h3>
+
+                <div class="rounded-xl border border-amber-500/20 bg-amber-900/10 p-5 space-y-4">
+                    <p v-if="data.continuity?.continuityNote" class="m-0 text-sm text-amber-100 leading-relaxed">
+                        {{ data.continuity.continuityNote }}
+                    </p>
+
+                    <div v-if="data.continuity?.previousReport" class="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+                        <div class="rounded-lg border border-slate-700/60 bg-slate-900/40 p-4">
+                            <div class="text-xs text-slate-500 mb-2">上一份报告</div>
+                            <div class="space-y-2 text-slate-300">
+                                <p class="m-0">时间: {{ formatTimestamp(data.continuity.previousReport.timestamp) }}</p>
+                                <p class="m-0">建议: {{ data.continuity.previousReport.advice }}</p>
+                                <p class="m-0">评分: {{ data.continuity.previousReport.score }}</p>
+                                <p class="m-0">结论: {{ data.continuity.previousReport.oneLineDecision || 'N/A' }}</p>
+                            </div>
+                        </div>
+
+                        <div class="rounded-lg border border-slate-700/60 bg-slate-900/40 p-4">
+                            <div class="text-xs text-slate-500 mb-2">上一份关键价位</div>
+                            <div class="space-y-2 text-slate-300">
+                                <p class="m-0">当时价格: {{ data.continuity.previousReport.currentPrice ?? 'N/A' }}</p>
+                                <p class="m-0">目标价: {{ data.continuity.previousReport.targetPrice ?? 'N/A' }}</p>
+                                <p class="m-0">止损位: {{ data.continuity.previousReport.stopLoss ?? 'N/A' }}</p>
+                                <p class="m-0">理由: {{ data.continuity.previousReport.reasoning || 'N/A' }}</p>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -138,6 +219,67 @@
                         <div v-if="section.data?.riskAssessment && !section.data.riskAssessment.includes('分析报告')" class="flex items-start gap-2 text-sm bg-rose-900/10 p-3 rounded border border-rose-900/20">
                             <AlertTriangle class="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
                             <span class="text-rose-300/90 italic">{{ section.data.riskAssessment }}</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="mb-10">
+                <h3 class="flex items-center gap-2 text-2xl font-bold text-slate-100 mb-6 pb-2 border-b border-slate-700/50">
+                    <MessageSquare class="w-6 h-6 text-cyan-400" />
+                    报告问答
+                </h3>
+
+                <div class="rounded-xl border border-slate-700 bg-slate-800/70 p-5">
+                    <div class="space-y-4">
+                        <div class="max-h-80 overflow-y-auto space-y-3 pr-1">
+                            <div
+                                v-for="message in qaMessages"
+                                :key="message.id"
+                                class="rounded-xl px-4 py-3"
+                                :class="message.role === 'user' ? 'bg-cyan-600/20 border border-cyan-500/20 text-cyan-50' : 'bg-slate-900/50 border border-slate-700 text-slate-200'"
+                            >
+                                <div class="text-xs uppercase tracking-[0.2em] mb-2" :class="message.role === 'user' ? 'text-cyan-300' : 'text-slate-500'">
+                                    {{ message.role === 'user' ? '你的问题' : '报告助手' }}
+                                </div>
+                                <p class="m-0 whitespace-pre-wrap leading-relaxed text-sm">{{ message.content }}</p>
+                            </div>
+
+                            <div v-if="qaLoading" class="rounded-xl border border-slate-700 bg-slate-900/50 px-4 py-3 text-sm text-slate-400">
+                                正在结合当前报告和上次分析生成回答...
+                            </div>
+                        </div>
+
+                        <div class="grid gap-3">
+                            <div class="flex flex-wrap gap-2">
+                                <button
+                                    v-for="prompt in qaQuickPrompts"
+                                    :key="prompt"
+                                    @click="questionInput = prompt"
+                                    class="rounded-full border border-slate-700 bg-slate-900/40 px-3 py-1.5 text-xs text-slate-300 hover:border-cyan-500/30 hover:text-cyan-200 transition-colors"
+                                >
+                                    {{ prompt }}
+                                </button>
+                            </div>
+
+                            <textarea
+                                v-model="questionInput"
+                                rows="3"
+                                placeholder="比如：这次买点为什么和上次不一样？止损应该怎么执行？"
+                                class="w-full rounded-xl border border-slate-700 bg-slate-900/60 px-4 py-3 text-sm text-slate-100 placeholder-slate-500 outline-none focus:border-cyan-500/40"
+                            ></textarea>
+
+                            <div v-if="qaError" class="text-sm text-rose-300">{{ qaError }}</div>
+
+                            <div class="flex justify-end">
+                                <button
+                                    @click="askQuestion"
+                                    :disabled="qaLoading || !questionInput.trim()"
+                                    class="rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-500 disabled:opacity-50 transition-colors"
+                                >
+                                    提问
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -322,10 +464,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref } from 'vue';
+import axios from 'axios';
 import { 
-    X, FileText, Zap, Quote, Activity, TrendingUp, BarChart2, Globe, 
-    AlertTriangle, GitFork, Target, Lightbulb, PieChart, Coins, Info
+    X, FileText, Zap, Quote, Activity, Globe, 
+    AlertTriangle, GitFork, Target, PieChart, Coins, Info, MessageSquare
 } from 'lucide-vue-next';
 import type { StockAnalysis } from '../types';
 
@@ -335,11 +478,22 @@ const props = defineProps<{
 
 defineEmits(['close']);
 
-// Helper to check if text is short enough to display normally
-const isShort = (text?: string) => {
-    if (!text) return true;
-    return text.length < 15;
-};
+interface QaMessage {
+    id: string;
+    role: 'user' | 'assistant';
+    content: string;
+}
+
+const questionInput = ref('');
+const qaLoading = ref(false);
+const qaError = ref<string | null>(null);
+const qaMessages = ref<QaMessage[]>([]);
+const qaQuickPrompts = [
+    '这次买点为什么和上次不一样？',
+    '这次止损位应该怎么执行？',
+    '当前最大的风险是什么？',
+    '如果没买到第一买点，后面怎么办？'
+];
 
 const detailedSections = computed(() => {
     // Dynamically filter out sections that might not exist or we want to hide if empty
@@ -377,6 +531,105 @@ const detailedSections = computed(() => {
     // Filter out sections with no data
     return sections.filter(s => s.data);
 });
+
+const qualitySections = computed(() => {
+    const quality = props.data.dataQuality;
+    if (!quality) return [];
+
+    const sections = [
+        { key: 'snapshot', label: '实时快照', meta: quality.snapshot, extraText: '' },
+        { key: 'history', label: '历史K线', meta: quality.history, extraText: '' },
+        { key: 'financial', label: '财务数据', meta: quality.financial || undefined, extraText: '' },
+        {
+            key: 'fundflow',
+            label: '资金流',
+            meta: quality.fundFlow?.summary || undefined,
+            extraText: quality.fundFlow && quality.fundFlow.missingDays > 0
+                ? `${quality.fundFlow.missingDays} 个交易日存在缺失字段`
+                : ''
+        }
+    ];
+
+    return sections
+        .filter((section) => section.meta)
+        .map((section) => {
+            const meta = section.meta!;
+            const tone = meta.qualityLevel === 'high'
+                ? {
+                    panelClass: 'border-emerald-500/20 bg-emerald-900/10',
+                    badgeClass: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                }
+                : meta.qualityLevel === 'medium'
+                    ? {
+                        panelClass: 'border-amber-500/20 bg-amber-900/10',
+                        badgeClass: 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                    }
+                    : {
+                        panelClass: 'border-rose-500/20 bg-rose-900/10',
+                        badgeClass: 'border-rose-500/30 bg-rose-500/10 text-rose-300'
+                    };
+
+            return {
+                ...section,
+                ...tone,
+                source: meta.source,
+                scoreText: `${meta.qualityLevel.toUpperCase()} ${meta.qualityScore}`,
+                asOf: meta.asOf || '未知',
+                tierText: meta.tier === 'primary' ? '主接口' : meta.tier === 'fallback' ? '回退接口' : '缓存',
+                flagsText: [
+                    meta.cacheHit ? '命中缓存' : '实时抓取',
+                    meta.stale ? '已过期' : '未过期',
+                    meta.isEstimated ? '含估算字段' : '无估算'
+                ].join(' / '),
+                issues: meta.issues.slice(0, 4),
+            };
+        });
+});
+
+const askQuestion = async () => {
+    const question = questionInput.value.trim();
+    if (!question) return;
+
+    qaError.value = null;
+    qaMessages.value.push({
+        id: `q_${Date.now()}`,
+        role: 'user',
+        content: question,
+    });
+
+    questionInput.value = '';
+    qaLoading.value = true;
+
+    try {
+        const response = await axios.post('/api/report/qa', {
+            question,
+            symbol: props.data.symbol || props.data.continuity?.previousReport?.symbol,
+            reportData: props.data,
+            mode: props.data.analysisMode,
+        });
+
+        qaMessages.value.push({
+            id: `a_${Date.now()}`,
+            role: 'assistant',
+            content: response.data.answer,
+        });
+    } catch (error: any) {
+        qaError.value = error.response?.data?.error || '报告问答失败，请稍后再试';
+    } finally {
+        qaLoading.value = false;
+    }
+};
+
+const formatTimestamp = (timestamp: number) => {
+    return new Date(timestamp).toLocaleString('zh-CN', { hour12: false });
+};
+
+const formatAsOf = (value?: string) => {
+    if (!value) return '未知';
+    const normalized = value.replace('T', ' ');
+    const match = normalized.match(/^(\d{4}-\d{2}-\d{2})/);
+    return match ? match[1] : value;
+};
 </script>
 
 <style scoped>

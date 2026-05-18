@@ -13,9 +13,14 @@
       
             <!-- Search Header -->
             <div class="flex flex-col items-center space-y-6 pt-10 pb-6">
-                <h1 class="text-4xl font-extrabold tracking-tight bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
-                A股 AI 量化决策看板
-                </h1>
+                <div class="space-y-2 text-center">
+                    <h1 class="text-4xl font-extrabold tracking-tight bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">
+                    股票诊断
+                    </h1>
+                    <p class="text-sm text-slate-400 sm:text-base">
+                        输入股票代码开始分析
+                    </p>
+                </div>
                 
                 <div class="relative w-full max-w-lg group">
                 <div class="absolute -inset-1 bg-gradient-to-r from-indigo-500 to-cyan-500 rounded-lg blur opacity-25 group-hover:opacity-50 transition duration-1000 group-hover:duration-200"></div>
@@ -57,6 +62,27 @@
                     </div>
                 </div>
                 </div>
+
+                <!-- Analysts Selection -->
+                <div class="flex justify-center gap-6 pt-2">
+                    <label v-for="option in analystsOptions" :key="option.id" class="flex items-center space-x-2 cursor-pointer group">
+                        <div class="relative flex items-center">
+                            <input 
+                                type="checkbox" 
+                                :value="option.id" 
+                                v-model="selectedAnalysts" 
+                                class="peer h-4 w-4 cursor-pointer appearance-none rounded border border-slate-600 bg-slate-800 transition-all checked:border-indigo-500 checked:bg-indigo-500 hover:border-indigo-400"
+                            >
+                            <div class="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-white opacity-0 peer-checked:opacity-100">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor">
+                                    <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                                </svg>
+                            </div>
+                        </div>
+                        <span class="text-sm text-slate-400 group-hover:text-indigo-300 transition-colors">{{ option.label }}</span>
+                    </label>
+                </div>
+
             </div>
 
             <!-- Content Area -->
@@ -127,6 +153,14 @@ const error = ref<string | null>(null);
 const result = ref<StockAnalysis | null>(null);
 const historySidebarRef = ref<InstanceType<typeof HistorySidebar> | null>(null);
 
+const selectedAnalysts = ref(['technical', 'fundamental', 'capital']);
+
+const analystsOptions = [
+    { id: 'technical', label: '技术面分析' },
+    { id: 'fundamental', label: '基本面分析' },
+    { id: 'capital', label: '资金面分析' }
+];
+
 // Autocomplete logic
 const suggestions = ref<Array<{ symbol: string; name: string }>>([]);
 let searchTimeout: any = null;
@@ -167,7 +201,11 @@ const handleSearch = async () => {
 
   try {
     // Assuming backend endpoint is /api/stock/diagnosis/:code
-    const response = await axios.get<StockAnalysis>(`/api/stock/diagnosis/${query}`);
+    const params = new URLSearchParams();
+    if (selectedAnalysts.value.length > 0) {
+        params.append('analysts', selectedAnalysts.value.join(','));
+    }
+    const response = await axios.get<StockAnalysis>(`/api/stock/diagnosis/${query}?${params.toString()}`);
     result.value = response.data;
     
     // Refresh history after successful search

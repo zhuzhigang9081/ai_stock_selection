@@ -35,6 +35,9 @@
         <div class="flex justify-between items-center">
             <span class="text-xs text-slate-400 font-mono">{{ item.symbol }}</span>
             <div class="flex items-center gap-2">
+                 <span class="text-[10px] font-bold px-1.5 py-0.5 rounded border uppercase tracking-wide bg-emerald-500/10 text-emerald-300 border-emerald-500/20">
+                    盘后
+                 </span>
                  <span :class="['text-xs font-bold px-1.5 py-0.5 rounded', getScoreColor(item.score)]">
                     {{ item.score }}
                  </span>
@@ -54,6 +57,7 @@ import type { StockAnalysis } from '../types';
 interface HistoryRecord {
   id: string;
   timestamp: number;
+  mode?: 'postmarket';
   stockName: string;
   symbol: string;
   score: number;
@@ -61,8 +65,8 @@ interface HistoryRecord {
   fullData: StockAnalysis;
 }
 
-const props = defineProps<{
-  refreshKey?: number; // Optional prop to trigger refresh
+defineProps<{
+  refreshKey?: number;
 }>();
 
 const emit = defineEmits(['select', 'refresh']);
