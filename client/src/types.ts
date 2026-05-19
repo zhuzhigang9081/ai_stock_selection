@@ -186,3 +186,34 @@ export interface ReportContinuitySummary {
   stopLoss?: number | null;
   reasoning?: string;
 }
+
+export type DailyAdviceAction = 'buy' | 'sell' | 'hold' | 'watch';
+
+export interface DailyAdviceRecord {
+  id: string;
+  date: string;
+  timestamp: number;
+  symbol: string;
+  stockName: string;
+  action: DailyAdviceAction;
+  confidence: number;
+  score: number;
+  summary: string;
+  reasons: string[];
+  riskFlags: string[];
+  entryRange?: string;
+  stopLoss?: string;
+  targetPrice?: string;
+  holdingPeriod?: string;
+  analysisMode: 'postmarket';
+  sourceReport: {
+    advice: string;
+    oneLineDecision?: string;
+    reasoning?: string;
+  };
+  continuity?: {
+    previousAction?: DailyAdviceAction;
+    changed: boolean;
+    changeSummary?: string;
+  };
+}

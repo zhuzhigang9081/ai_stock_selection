@@ -85,6 +85,13 @@
 
             </div>
 
+            <DailyAdvicePanel
+              ref="dailyAdvicePanelRef"
+              :current-symbol="searchQuery.trim() || result?.symbol"
+              :analysts="selectedAnalysts"
+              @select-symbol="handleAdviceSelect"
+            />
+
             <!-- Content Area -->
             <div class="transition-all duration-500 ease-in-out">
                 
@@ -144,6 +151,7 @@ import { ref } from 'vue';
 import axios from 'axios';
 import { Search, BarChart, BrainCircuit, Clock, Loader2 } from 'lucide-vue-next';
 import AnalysisDashboard from '../components/AnalysisDashboard.vue';
+import DailyAdvicePanel from '../components/DailyAdvicePanel.vue';
 import HistorySidebar from '../components/HistorySidebar.vue';
 import type { StockAnalysis } from '../types';
 
@@ -152,6 +160,7 @@ const loading = ref(false);
 const error = ref<string | null>(null);
 const result = ref<StockAnalysis | null>(null);
 const historySidebarRef = ref<InstanceType<typeof HistorySidebar> | null>(null);
+const dailyAdvicePanelRef = ref<InstanceType<typeof DailyAdvicePanel> | null>(null);
 
 const selectedAnalysts = ref(['technical', 'fundamental', 'capital']);
 
@@ -212,6 +221,9 @@ const handleSearch = async () => {
     if (historySidebarRef.value) {
         historySidebarRef.value.fetchHistory();
     }
+    if (dailyAdvicePanelRef.value) {
+        dailyAdvicePanelRef.value.fetchAdvice();
+    }
   } catch (err: any) {
     console.error(err);
     error.value = err.response?.data?.error || 'Failed to fetch analysis data. Please check the code and try again.';
@@ -229,6 +241,12 @@ const handleHistorySelect = (payload: { fullData: StockAnalysis, symbol: string 
     
     loading.value = false;
     error.value = null;
+};
+
+const handleAdviceSelect = async (symbol: string) => {
+    searchQuery.value = symbol;
+    suggestions.value = [];
+    await handleSearch();
 };
 
 const refreshHistory = () => {

@@ -1,10 +1,22 @@
 import { Router, Request, Response } from 'express';
 import { fetchStockSnapshot, fetchStockHistory, searchStocks, fetchStockSector, fetchIndustryRank, fetchFinancialData, fetchFundFlowData, StockSnapshot } from '../services/dataService';
 import { analyzeStock, answerReportQuestion } from '../services/aiEngine';
-
 import { getHistory, addHistory, getLatestHistoryBySymbol, buildContinuitySummary } from '../services/historyService';
+import { generateDailyAdviceBatch, generateDailyAdviceForSymbol, getDailyAdviceHistory, getLatestDailyAdvice } from '../services/adviceService';
 
 const router = Router();
+
+function parseAnalysts(input: unknown): string[] {
+  if (typeof input === 'string') {
+    return input.split(',').map((item) => item.trim()).filter(Boolean);
+  }
+
+  if (Array.isArray(input)) {
+    return input.map((item) => String(item).trim()).filter(Boolean);
+  }
+
+  return ['technical', 'fundamental', 'capital'];
+}
 
 /**
  * @swagger
@@ -47,6 +59,75 @@ router.post('/report/qa', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('报告问答失败:', error);
     res.status(500).json({ error: '报告问答失败', details: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+router.get('/daily-advice', (req: Request, res: Response) => {
+  const symbol = typeof req.query.symbol === 'string' ? req.query.symbol.trim() : undefined;
+  const date = typeof req.query.date === 'string' ? req.query.date.trim() : undefined;
+  const limit = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined;
+
+  const items = getDailyAdviceHistory({
+    symbol,
+    date,
+    limit: Number.isFinite(limit) ? limit : undefined,
+  });
+
+  res.json({
+    count: items.length,
+    items,
+  });
+});
+
+router.get('/daily-advice/latest/:symbol', (req: Request, res: Response) => {
+  const symbol = req.params.symbol as string;
+  const item = getLatestDailyAdvice(symbol);
+
+  if (!item) {
+    return res.status(404).json({ error: '未找到该股票的每日建议' });
+  }
+
+  res.json(item);
+});
+
+router.post('/daily-advice/generate', async (req: Request, res: Response) => {
+  try {
+    const { symbol, symbols, analysts } = req.body || {};
+    const normalizedSymbols = Array.isArray(symbols)
+      ? symbols.map((item) => String(item).trim()).filter(Boolean)
+      : typeof symbol === 'string' && symbol.trim()
+        ? [symbol.trim()]
+        : [];
+
+    if (normalizedSymbols.length === 0) {
+      return res.status(400).json({ error: 'symbol 或 symbols 为必填项' });
+    }
+
+    const parsedAnalysts = parseAnalysts(analysts);
+
+    if (normalizedSymbols.length === 1) {
+      const item = await generateDailyAdviceForSymbol(normalizedSymbols[0], parsedAnalysts);
+      return res.json({
+        date: item.date,
+        count: 1,
+        items: [item],
+      });
+    }
+
+    const items = await generateDailyAdviceBatch(normalizedSymbols, parsedAnalysts);
+    return res.json({
+      date: new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).format(new Date()),
+      count: items.length,
+      items,
+    });
+  } catch (error) {
+    console.error('生成每日建议失败:', error);
+    res.status(500).json({ error: '生成每日建议失败', details: error instanceof Error ? error.message : String(error) });
   }
 });
 
@@ -211,16 +292,8 @@ router.get('/stock/search', async (req: Request, res: Response) => {
 //ai选股诊断接口
 router.get('/stock/diagnosis/:code', async (req: Request, res: Response) => {
   const code = req.params.code as string;
-  const analystsParam = req.query.analysts;
   const mode = 'postmarket';
-  
-  let analysts: string[] = ['technical', 'fundamental', 'capital']; // Default
-
-  if (typeof analystsParam === 'string') {
-      analysts = analystsParam.split(',');
-  } else if (Array.isArray(analystsParam)) {
-      analysts = analystsParam as string[];
-  }
+  const analysts = parseAnalysts(req.query.analysts);
   
   try {
     console.log(`正在分析股票: ${code}`);
